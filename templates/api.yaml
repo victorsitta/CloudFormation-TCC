@@ -1,0 +1,334 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  API Gateway REST — DocSaaS Infra TCC
+  =======================================
+  Este template cria o ponto de entrada REST do sistema.
+  É o último a ser criado porque depende dos ARNs das Lambdas do compute.yaml.
+
+  O API Gateway é o único recurso exposto publicamente — tudo mais (S3, DynamoDB,
+  Lambda) fica privado e acessível apenas via as rotas definidas aqui.
+
+  Rotas criadas:
+    POST   /documents/upload-url              → Lambda Access Verifier
+    GET    /documents/download-url/{documentId} → Lambda Access Verifier
+    GET    /documents                         → Lambda Metadata Handler
+    DELETE /documents/{documentId}            → Lambda Metadata Handler
+
+  Autenticação:
+    Todas as rotas requerem o header: Authorization: Bearer {JWT}
+    O API Gateway valida apenas a PRESENÇA do header (retorna 401 se ausente).
+    A validação da assinatura JWT é feita dentro de cada Lambda.
+
+  Stage:
+    O deploy é feito no stage "simulation" — a URL final será:
+    https://{api-id}.execute-api.{region}.amazonaws.com/simulation
+
+# ==============================================================================
+# PARÂMETROS
+# Recebidos do main.yaml via nested stack
+# ==============================================================================
+Parameters:
+
+  Environment:
+    Type: String
+    Default: simulation
+    AllowedValues: [simulation, staging, production]
+
+  ProjectName:
+    Type: String
+    Default: docsaas
+
+  # ARNs das Lambdas (do compute.yaml)
+  LambdaAccessVerifierArn:
+    Type: String
+    Description: ARN da Lambda Access Verifier (upload e download URLs)
+
+  LambdaMetadataHandlerArn:
+    Type: String
+    Description: ARN da Lambda Metadata Handler (listar e deletar documentos)
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+Resources:
+
+  # ============================================================================
+  # RECURSO 1 — REST API
+  # ============================================================================
+  # Define a API REST principal. O nome e a descrição aparecem no console AWS.
+  # EndpointConfiguration REGIONAL significa que a API fica em uma região específica
+  # (mais simples e suficiente para o TCC — EDGE usaria CloudFront globalmente).
+  # ============================================================================
+  DocSaaSRestAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub ${ProjectName}-api-${Environment}
+      Description: !Sub >
+        API REST para o SaaS de gestão de documentos — ${ProjectName} ${Environment}.
+        Ponto de entrada para upload, download e gestão de documentos multi-tenant.
+
+      # REGIONAL: API disponível apenas na região AWS onde foi criada
+      # Adequado para TCC — sem necessidade de distribuição global via CloudFront
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================================
+  # RECURSO 2 — Request Validator
+  # ============================================================================
+  # Valida que o header Authorization está presente em todas as requisições.
+  # Se ausente, o API Gateway retorna 400 antes mesmo de invocar a Lambda.
+  # Isso poupa invocações Lambda desnecessárias para requisições sem JWT.
+  # ============================================================================
+  RequestValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      RestApiId: !Ref DocSaaSRestAPI
+      Name: ValidateHeaders
+      ValidateRequestBody: false    # Não valida o body (a Lambda faz isso)
+      ValidateRequestParameters: true  # Valida headers e query params
+
+  # ============================================================================
+  # ESTRUTURA DE RECURSOS (ROTAS)
+  # ============================================================================
+  # Hierarquia de recursos:
+  #   /documents
+  #   /documents/upload-url
+  #   /documents/download-url
+  #   /documents/download-url/{documentId}
+  #   /documents/{documentId}
+  # ============================================================================
+
+  # Recurso raiz: /documents
+  DocumentsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DocSaaSRestAPI
+      ParentId: !GetAtt DocSaaSRestAPI.RootResourceId  # Pai é o root "/"
+      PathPart: documents  # Cria o path /documents
+
+  # Recurso: /documents/upload-url
+  UploadUrlResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DocSaaSRestAPI
+      ParentId: !Ref DocumentsResource  # Pai é /documents
+      PathPart: upload-url  # Cria o path /documents/upload-url
+
+  # Recurso: /documents/download-url
+  DownloadUrlResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DocSaaSRestAPI
+      ParentId: !Ref DocumentsResource  # Pai é /documents
+      PathPart: download-url  # Cria o path /documents/download-url
+
+  # Recurso: /documents/download-url/{documentId}
+  # {documentId} é um path parameter — capturado e passado para a Lambda
+  DownloadUrlDocumentResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DocSaaSRestAPI
+      ParentId: !Ref DownloadUrlResource  # Pai é /documents/download-url
+      PathPart: '{documentId}'  # Path parameter dinâmico
+
+  # Recurso: /documents/{documentId}
+  # Usado para DELETE /documents/{documentId}
+  DocumentByIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DocSaaSRestAPI
+      ParentId: !Ref DocumentsResource  # Pai é /documents
+      PathPart: '{documentId}'  # Path parameter dinâmico
+
+  # ============================================================================
+  # ROTA 1 — POST /documents/upload-url
+  # ============================================================================
+  # Solicita uma Pre-signed URL para upload de um documento.
+  # O cliente envia filename, contentType e sizeBytes no body.
+  # A Lambda Access Verifier valida o JWT, gera documentId e retorna a URL.
+  # ============================================================================
+  UploadUrlMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DocSaaSRestAPI
+      ResourceId: !Ref UploadUrlResource  # /documents/upload-url
+      HttpMethod: POST
+      AuthorizationType: NONE  # Sem autenticação nativa do API Gateway
+      # A validação JWT é feita pela Lambda (mais flexível para o TCC)
+
+      # Validação do header Authorization — retorna 400 se ausente
+      RequestValidatorId: !Ref RequestValidator
+      RequestParameters:
+        method.request.header.Authorization: true  # Header obrigatório
+
+      # Integração com a Lambda Access Verifier
+      Integration:
+        Type: AWS_PROXY  # Passa o evento completo para a Lambda (sem transformação)
+        IntegrationHttpMethod: POST  # API Gateway sempre usa POST para invocar Lambda
+        Uri: !Sub >
+          arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaAccessVerifierArn}/invocations
+
+  # ============================================================================
+  # ROTA 2 — GET /documents/download-url/{documentId}
+  # ============================================================================
+  # Solicita uma Pre-signed URL para download de um documento específico.
+  # A Lambda verifica se o tenant do JWT é o dono do documento (tenant mismatch).
+  # Se o documento estiver no Glacier, retorna downloadUrl: null.
+  # ============================================================================
+  DownloadUrlMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DocSaaSRestAPI
+      ResourceId: !Ref DownloadUrlDocumentResource  # /documents/download-url/{documentId}
+      HttpMethod: GET
+      AuthorizationType: NONE
+
+      RequestValidatorId: !Ref RequestValidator
+      RequestParameters:
+        method.request.header.Authorization: true   # Header JWT obrigatório
+        method.request.path.documentId: true         # Path parameter obrigatório
+
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub >
+          arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaAccessVerifierArn}/invocations
+
+  # ============================================================================
+  # ROTA 3 — GET /documents
+  # ============================================================================
+  # Lista todos os documentos ativos (deleted=false) do tenant autenticado.
+  # A Lambda Metadata Handler faz Query no GSI TenantIndex do DynamoDB.
+  # Suporta paginação via query params limit e nextToken.
+  # ============================================================================
+  ListDocumentsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DocSaaSRestAPI
+      ResourceId: !Ref DocumentsResource  # /documents
+      HttpMethod: GET
+      AuthorizationType: NONE
+
+      RequestValidatorId: !Ref RequestValidator
+      RequestParameters:
+        method.request.header.Authorization: true  # Header JWT obrigatório
+        method.request.querystring.limit: false     # Query param opcional
+        method.request.querystring.nextToken: false # Query param opcional (paginação)
+
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub >
+          arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaMetadataHandlerArn}/invocations
+
+  # ============================================================================
+  # ROTA 4 — DELETE /documents/{documentId}
+  # ============================================================================
+  # Realiza eliminação LÓGICA de um documento.
+  # O arquivo NÃO é removido do S3 — apenas o campo deleted=true no DynamoDB.
+  # Isso preserva os arquivos para auditoria e conformidade (LGPD, etc.).
+  # ============================================================================
+  DeleteDocumentMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DocSaaSRestAPI
+      ResourceId: !Ref DocumentByIdResource  # /documents/{documentId}
+      HttpMethod: DELETE
+      AuthorizationType: NONE
+
+      RequestValidatorId: !Ref RequestValidator
+      RequestParameters:
+        method.request.header.Authorization: true  # Header JWT obrigatório
+        method.request.path.documentId: true        # Path parameter obrigatório
+
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub >
+          arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaMetadataHandlerArn}/invocations
+
+  # ============================================================================
+  # RECURSO 3 — Deployment
+  # ============================================================================
+  # O Deployment "publica" as configurações da API num stage.
+  # Sem o Deployment, a API existe mas não tem URL pública acessível.
+  # O DependsOn garante que todos os métodos estejam criados antes do deploy.
+  # ============================================================================
+  APIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - UploadUrlMethod       # POST /documents/upload-url
+      - DownloadUrlMethod     # GET  /documents/download-url/{documentId}
+      - ListDocumentsMethod   # GET  /documents
+      - DeleteDocumentMethod  # DELETE /documents/{documentId}
+    Properties:
+      RestApiId: !Ref DocSaaSRestAPI
+      Description: !Sub Deploy da API ${ProjectName} para o stage ${Environment}
+
+  # ============================================================================
+  # RECURSO 4 — Stage
+  # ============================================================================
+  # O Stage é o ambiente de execução da API — define a URL final.
+  # Stage "simulation" resulta na URL:
+  #   https://{api-id}.execute-api.{region}.amazonaws.com/simulation
+  #
+  # Logging ativado: registra todas as requisições no CloudWatch
+  # com método, caminho, status e latência.
+  # ============================================================================
+  APIStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref DocSaaSRestAPI
+      DeploymentId: !Ref APIDeployment
+      StageName: !Ref Environment  # Nome do stage = simulation
+
+      Description: !Sub Stage ${Environment} do DocSaaS API
+
+      # Logging de todas as requisições no CloudWatch
+      # Útil para demonstrar o sistema na apresentação do TCC
+      MethodSettings:
+        - ResourcePath: '/*'    # Todas as rotas
+          HttpMethod: '*'       # Todos os métodos
+          LoggingLevel: INFO    # Loga requisições e respostas
+          DataTraceEnabled: true  # Loga o body das requisições (apenas para debug/TCC)
+          MetricsEnabled: true    # Ativa métricas de latência e erros no CloudWatch
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+# ==============================================================================
+# OUTPUTS
+# Exporta a URL do API Gateway — o valor mais importante deste template.
+# A equipe MVP vai usar esta URL para integrar o backend Node.js com a infra AWS.
+# ==============================================================================
+Outputs:
+
+  APIGatewayURL:
+    Description: >
+      URL base do API Gateway. Use esta URL no backend Node.js da equipe MVP.
+      Exemplo de uso: POST {URL}/documents/upload-url
+    Value: !Sub https://${DocSaaSRestAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-APIGatewayURL
+
+  APIGatewayId:
+    Description: ID do API Gateway REST
+    Value: !Ref DocSaaSRestAPI
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-APIGatewayId
+
+  APIGatewayRootResourceId:
+    Description: ID do recurso raiz do API Gateway
+    Value: !GetAtt DocSaaSRestAPI.RootResourceId
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-APIRootResourceId

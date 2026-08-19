@@ -1,0 +1,406 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  IAM Roles e Policies — DocSaaS Infra TCC
+  ==========================================
+  Este template define as permissões de acesso para cada função Lambda do sistema.
+  Segue o princípio do menor privilégio: cada Lambda recebe APENAS o que precisa.
+
+  Roles criadas:
+    1. LambdaAccessVerifierRole  → Lambda que valida JWT e gera Pre-signed URLs
+    2. LambdaMetadataHandlerRole → Lambda que faz CRUD de metadados no DynamoDB
+    3. LambdaArchiveTriggerRole  → Lambda que atualiza DynamoDB após arquivamento no Glacier
+
+  IMPORTANTE: Os nomes dos recursos usados nas políticas abaixo seguem o padrão:
+    - S3 Standard:  docsaas-standard-{environment}
+    - S3 Glacier:   docsaas-glacier-{environment}
+    - DynamoDB:     docsaas-documents-{environment}
+    - SNS Topic:    docsaas-events-{environment}
+  Esses nomes DEVEM ser idênticos aos definidos nos templates storage.yaml,
+  database.yaml e monitoring.yaml para que as permissões funcionem corretamente.
+
+# ==============================================================================
+# PARÂMETROS
+# Recebidos do main.yaml via nested stack
+# ==============================================================================
+Parameters:
+
+  Environment:
+    Type: String
+    Default: simulation
+    AllowedValues: [simulation, staging, production]
+    Description: Ambiente de execução — usado como sufixo nos nomes dos recursos
+
+  ProjectName:
+    Type: String
+    Default: docsaas
+    Description: Prefixo de todos os recursos — usado para montar os ARNs das políticas
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+Resources:
+
+  # ============================================================================
+  # ROLE 1 — Lambda Access Verifier
+  # ============================================================================
+  # Esta Lambda é a guardiã do sistema. Ela:
+  #   1. Recebe a requisição do API Gateway com o JWT no header
+  #   2. Valida o JWT e extrai tenantId e userId
+  #   3. Gera uma Pre-signed URL temporária (900s) para upload ou download no S3
+  #
+  # Por isso precisa de:
+  #   - S3: GetObject e PutObject (para gerar URLs de leitura e escrita)
+  #   - KMS: GenerateDataKey e Decrypt (S3 usa KMS para criptografar os objetos)
+  #   - CloudWatch: escrever logs de cada decisão de acesso (aprovado ou negado)
+  # ============================================================================
+  LambdaAccessVerifierRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-access-verifier-role
+      Description: >
+        Role da Lambda Access Verifier. Permite gerar Pre-signed URLs no S3
+        e registar logs no CloudWatch. Não tem acesso direto ao DynamoDB.
+
+      # Trust Policy — define QUEM pode assumir esta Role
+      # Aqui só o serviço Lambda (lambda.amazonaws.com) pode usá-la
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com  # Apenas o serviço Lambda pode assumir esta role
+            Action: sts:AssumeRole           # Ação necessária para assumir a role
+
+      Policies:
+        - PolicyName: !Sub ${ProjectName}-${Environment}-access-verifier-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+
+              # ------------------------------------------------------------------
+              # Permissão S3: GetObject + PutObject
+              # ------------------------------------------------------------------
+              # Necessário para que a Lambda possa gerar Pre-signed URLs.
+              # Mesmo que a Lambda não faça o upload/download diretamente,
+              # ela precisa dessas permissões para assinar a URL que o cliente vai usar.
+              #
+              # Recursos: ambos os buckets (Standard e Glacier)
+              #   - Standard: para uploads novos e downloads de arquivos recentes
+              #   - Glacier: para downloads de arquivos arquivados (365+ dias)
+              #
+              # O /* no final significa: qualquer objeto dentro do bucket
+              # O isolamento por tenant (prefixo {tenantId}/*) é reforçado
+              # na lógica da Lambda — a URL gerada sempre aponta para o prefixo correto
+              # ------------------------------------------------------------------
+              - Sid: S3PresignedURLPermissions
+                Effect: Allow
+                Action:
+                  - s3:GetObject   # Permite gerar Pre-signed URL de download
+                  - s3:PutObject   # Permite gerar Pre-signed URL de upload
+                Resource:
+                  - !Sub arn:aws:s3:::${ProjectName}-standard-${Environment}/*  # Todos os objetos do bucket Standard
+                  - !Sub arn:aws:s3:::${ProjectName}-glacier-${Environment}/*   # Todos os objetos do bucket Glacier
+
+              # ------------------------------------------------------------------
+              # Permissão KMS: GenerateDataKey + Decrypt
+              # ------------------------------------------------------------------
+              # O S3 usa KMS (SSE-KMS) para criptografar e descriptografar objetos.
+              # Quando a Lambda gera uma Pre-signed URL, a AWS verifica internamente
+              # se ela tem permissão KMS — sem isso, a URL gerada não funciona.
+              #
+              # A Condition kms:ViaService garante que a chave KMS só pode ser usada
+              # quando a solicitação vem do próprio serviço S3 — não diretamente.
+              # Isso é uma boa prática de segurança: evita uso indevido da chave.
+              # ------------------------------------------------------------------
+              - Sid: KMSPermissions
+                Effect: Allow
+                Action:
+                  - kms:GenerateDataKey  # Gera a chave de dados para criptografar objetos S3
+                  - kms:Decrypt          # Descriptografa a chave de dados para leitura de objetos S3
+                Resource: !Sub arn:aws:kms:*:${AWS::AccountId}:key/*
+                Condition:
+                  StringLike:
+                    kms:ViaService:
+                      - !Sub s3.${AWS::Region}.amazonaws.com  # KMS só pode ser usado via S3
+
+              # ------------------------------------------------------------------
+              # Permissão CloudWatch Logs: CreateLogGroup + CreateLogStream + PutLogEvents
+              # ------------------------------------------------------------------
+              # Toda Lambda precisa dessas permissões para escrever logs no CloudWatch.
+              # O padrão /aws/lambda/${ProjectName}-${Environment}-* cobre todos os
+              # log groups das Lambdas deste projeto neste ambiente.
+              #
+              # Logs registados por esta Lambda:
+              #   - Cada decisão de acesso (APPROVED ou DENIED)
+              #   - tenantId, userId, documentId e motivo da decisão
+              #   - Erros de JWT inválido ou expirado
+              # ------------------------------------------------------------------
+              - Sid: CloudWatchLogsPermissions
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup   # Cria o grupo de logs se não existir
+                  - logs:CreateLogStream  # Cria o stream dentro do grupo
+                  - logs:PutLogEvents     # Escreve os logs no stream
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-${Environment}-*:*
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: access-verifier
+
+  # ============================================================================
+  # ROLE 2 — Lambda Metadata Handler
+  # ============================================================================
+  # Esta Lambda gerencia os metadados dos documentos. Ela:
+  #   1. Cria um item no DynamoDB quando um documento é carregado
+  #   2. Lista documentos de um tenant (filtrando por tenantId e deleted=false)
+  #   3. Faz eliminação lógica (atualiza deleted=true, não remove o item)
+  #   4. Publica eventos no SNS (UPLOADED, ERROR)
+  #
+  # É a Lambda com mais permissões porque interage com mais serviços:
+  #   - DynamoDB: CRUD completo (GetItem, PutItem, UpdateItem, Query)
+  #   - KMS: para operações criptografadas no DynamoDB
+  #   - SNS: para publicar notificações de eventos
+  #   - CloudWatch: para logs de operações e erros
+  # ============================================================================
+  LambdaMetadataHandlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-metadata-handler-role
+      Description: >
+        Role da Lambda Metadata Handler. Permite CRUD no DynamoDB,
+        publicar eventos no SNS e registar logs no CloudWatch.
+
+      # Trust Policy — apenas Lambda pode assumir esta role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+
+      Policies:
+        - PolicyName: !Sub ${ProjectName}-${Environment}-metadata-handler-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+
+              # ------------------------------------------------------------------
+              # Permissão DynamoDB: GetItem, PutItem, UpdateItem, Query
+              # ------------------------------------------------------------------
+              # Cada ação tem uma finalidade específica:
+              #   - GetItem:    buscar metadado de um documento pelo documentId
+              #   - PutItem:    criar novo item após upload bem-sucedido
+              #   - UpdateItem: eliminação lógica (deleted=true) e atualização de storageClass
+              #   - Query:      listar documentos de um tenant via GSI TenantIndex
+              #
+              # Recursos: a tabela principal E o GSI (index/*)
+              # O GSI é necessário para queries por tenantId (listagem por tenant)
+              # ------------------------------------------------------------------
+              - Sid: DynamoDBPermissions
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem    # Buscar documento por documentId + tenantId
+                  - dynamodb:PutItem    # Criar metadado após upload
+                  - dynamodb:UpdateItem # Eliminação lógica e atualização de storageClass
+                  - dynamodb:Query      # Listar documentos por tenant via GSI
+                Resource:
+                  - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-documents-${Environment}         # Tabela principal
+                  - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-documents-${Environment}/index/* # GSI TenantIndex
+
+              # ------------------------------------------------------------------
+              # Permissão KMS: GenerateDataKey + Decrypt
+              # ------------------------------------------------------------------
+              # O DynamoDB usa KMS para criptografia em repouso.
+              # A Condition kms:ViaService restringe o uso da chave
+              # apenas quando a solicitação vem do serviço DynamoDB.
+              # ------------------------------------------------------------------
+              - Sid: KMSPermissions
+                Effect: Allow
+                Action:
+                  - kms:GenerateDataKey  # Criptografar dados escritos no DynamoDB
+                  - kms:Decrypt          # Descriptografar dados lidos do DynamoDB
+                Resource: !Sub arn:aws:kms:*:${AWS::AccountId}:key/*
+                Condition:
+                  StringLike:
+                    kms:ViaService:
+                      - !Sub dynamodb.${AWS::Region}.amazonaws.com  # KMS só pode ser usado via DynamoDB
+
+              # ------------------------------------------------------------------
+              # Permissão SNS: Publish
+              # ------------------------------------------------------------------
+              # Publica notificações após operações bem-sucedidas ou em caso de erro.
+              # Eventos publicados por esta Lambda:
+              #   - UPLOADED: quando metadado é criado com sucesso
+              #   - ERROR: quando qualquer operação falha criticamente
+              #
+              # Recurso: apenas o tópico SNS deste projeto/ambiente
+              # ------------------------------------------------------------------
+              - Sid: SNSPermissions
+                Effect: Allow
+                Action:
+                  - sns:Publish  # Publicar eventos UPLOADED e ERROR
+                Resource: !Sub arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-events-${Environment}
+
+              # ------------------------------------------------------------------
+              # Permissão CloudWatch Logs
+              # ------------------------------------------------------------------
+              # Logs registados por esta Lambda:
+              #   - Criação de metadados (documentId, tenantId, filename)
+              #   - Erros de escrita/leitura no DynamoDB
+              #   - Confirmação de publicação no SNS
+              # ------------------------------------------------------------------
+              - Sid: CloudWatchLogsPermissions
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-${Environment}-*:*
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: metadata-handler
+
+  # ============================================================================
+  # ROLE 3 — Lambda Archive Trigger
+  # ============================================================================
+  # Esta Lambda é acionada quando o S3 move um objeto do Standard para o Glacier
+  # (após 365 dias, via Lifecycle Policy). Ela:
+  #   1. Recebe o evento S3 com o objeto arquivado
+  #   2. Atualiza o campo storageClass no DynamoDB para "GLACIER"
+  #   3. Publica o evento ARCHIVED no SNS
+  #
+  # É a Role com MENOS permissões do sistema — só faz o que precisa:
+  #   - DynamoDB: apenas UpdateItem (não precisa criar ou listar)
+  #   - KMS: para a operação de UpdateItem no DynamoDB
+  #   - SNS: para publicar o evento ARCHIVED
+  #   - CloudWatch: para logs da transição
+  #
+  # Não tem acesso ao S3 pois não precisa ler ou escrever arquivos —
+  # apenas reage ao evento de transição.
+  # ============================================================================
+  LambdaArchiveTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-archive-trigger-role
+      Description: >
+        Role da Lambda Archive Trigger. Permissões mínimas: apenas UpdateItem no
+        DynamoDB e Publish no SNS. Não tem acesso direto ao S3.
+
+      # Trust Policy — apenas Lambda pode assumir esta role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+
+      Policies:
+        - PolicyName: !Sub ${ProjectName}-${Environment}-archive-trigger-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+
+              # ------------------------------------------------------------------
+              # Permissão DynamoDB: apenas UpdateItem
+              # ------------------------------------------------------------------
+              # Só precisa atualizar o campo storageClass de STANDARD para GLACIER.
+              # Não precisa de GetItem, PutItem ou Query — só UpdateItem.
+              # Recurso: apenas a tabela principal (sem GSI, pois não faz queries)
+              # ------------------------------------------------------------------
+              - Sid: DynamoDBUpdatePermission
+                Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem  # Atualizar storageClass para GLACIER
+                Resource:
+                  - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-documents-${Environment}
+
+              # ------------------------------------------------------------------
+              # Permissão KMS: GenerateDataKey + Decrypt
+              # ------------------------------------------------------------------
+              # Necessário para o UpdateItem no DynamoDB com criptografia em repouso.
+              # Mesmo sendo apenas uma atualização, o DynamoDB precisa
+              # criptografar o item atualizado com a chave KMS.
+              # ------------------------------------------------------------------
+              - Sid: KMSPermissions
+                Effect: Allow
+                Action:
+                  - kms:GenerateDataKey
+                  - kms:Decrypt
+                Resource: !Sub arn:aws:kms:*:${AWS::AccountId}:key/*
+                Condition:
+                  StringLike:
+                    kms:ViaService:
+                      - !Sub dynamodb.${AWS::Region}.amazonaws.com  # KMS só via DynamoDB
+
+              # ------------------------------------------------------------------
+              # Permissão SNS: Publish
+              # ------------------------------------------------------------------
+              # Publica o evento ARCHIVED após atualizar o DynamoDB.
+              # Schema do evento:
+              #   { "event": "ARCHIVED", "tenantId": "...", "documentId": "...", "archivedAt": "..." }
+              # ------------------------------------------------------------------
+              - Sid: SNSPermissions
+                Effect: Allow
+                Action:
+                  - sns:Publish  # Publicar evento ARCHIVED
+                Resource: !Sub arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-events-${Environment}
+
+              # ------------------------------------------------------------------
+              # Permissão CloudWatch Logs
+              # ------------------------------------------------------------------
+              # Logs registados por esta Lambda:
+              #   - documentId e tenantId do objeto arquivado
+              #   - Confirmação da atualização no DynamoDB
+              #   - Erros caso o documentId não exista na tabela
+              # ------------------------------------------------------------------
+              - Sid: CloudWatchLogsPermissions
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-${Environment}-*:*
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: archive-trigger
+
+# ==============================================================================
+# OUTPUTS
+# Os ARNs das Roles são exportados para o main.yaml repassar ao compute.yaml,
+# que os usa para associar cada Role à sua respectiva função Lambda.
+# ==============================================================================
+Outputs:
+
+  LambdaAccessVerifierRoleArn:
+    Description: ARN da Role IAM da Lambda Access Verifier (valida JWT e gera Pre-signed URLs)
+    Value: !GetAtt LambdaAccessVerifierRole.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-AccessVerifierRoleArn
+
+  LambdaMetadataHandlerRoleArn:
+    Description: ARN da Role IAM da Lambda Metadata Handler (CRUD no DynamoDB)
+    Value: !GetAtt LambdaMetadataHandlerRole.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-MetadataHandlerRoleArn
+
+  LambdaArchiveTriggerRoleArn:
+    Description: ARN da Role IAM da Lambda Archive Trigger (atualiza DynamoDB após Glacier)
+    Value: !GetAtt LambdaArchiveTriggerRole.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ArchiveTriggerRoleArn

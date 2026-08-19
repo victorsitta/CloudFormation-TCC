@@ -1,0 +1,272 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  KMS CMK + S3 Standard + S3 Glacier Deep Archive — DocSaaS Infra TCC.
+  Cria a camada de armazenamento: chave KMS para criptografia em repouso,
+  bucket S3 Standard para documentos ativos (0-365 dias) com lifecycle policy
+  para transicao automatica ao Glacier, e bucket S3 Glacier Deep Archive
+  para retencao historica (365+ dias). Isolamento multi-tenant via prefixo
+  {tenantId}/{documentId}/{filename}.
+
+# ==============================================================================
+# PARÂMETROS
+# Recebidos do main.yaml via nested stack
+# ==============================================================================
+Parameters:
+
+  Environment:
+    Type: String
+    Default: simulation
+    AllowedValues: [simulation, staging, production]
+    Description: Ambiente de execução
+
+  ProjectName:
+    Type: String
+    Default: docsaas
+    Description: Prefixo de todos os recursos
+
+  ArchiveDays:
+    Type: Number
+    Default: 365
+    Description: >
+      Número de dias até os documentos serem movidos automaticamente
+      do S3 Standard para o S3 Glacier Deep Archive via Lifecycle Policy.
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+Resources:
+
+  # ============================================================================
+  # RECURSO 1 — KMS Customer Managed Key (CMK)
+  # ============================================================================
+  # Chave de criptografia simétrica gerida pelo cliente.
+  # Usada para criptografar em repouso:
+  #   - Objetos no S3 Standard (SSE-KMS)
+  #   - Objetos no S3 Glacier (SSE-KMS)
+  #   - Dados na tabela DynamoDB
+  #
+  # Por que CMK e não AWS Managed Key?
+  #   - Controlo total da política de acesso (definida abaixo)
+  #   - Rotação automática anual ativada
+  #   - ARN exportado para outros templates usarem
+  #   - Demonstra boa prática de segurança no TCC
+  # ============================================================================
+  KMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub Chave KMS CMK para criptografia em repouso — ${ProjectName} ${Environment}
+
+      # Tipo simétrico ENCRYPT_DECRYPT — padrão para S3 e DynamoDB
+      KeySpec: SYMMETRIC_DEFAULT
+      KeyUsage: ENCRYPT_DECRYPT
+
+      # Rotação automática anual — boa prática de segurança
+      # A AWS cria uma nova versão da chave, mas dados antigos continuam acessíveis
+      EnableKeyRotation: true
+
+      # A chave começa ativa imediatamente após criação
+      Enabled: true
+
+      # Política da chave — define quem pode usar a chave KMS
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+
+          # Permite que o dono da conta AWS administre a chave via IAM
+          # Sem isso, a chave ficaria inacessível após criação
+          - Sid: EnableIAMUserPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+
+          # Permite que os serviços S3 e DynamoDB usem a chave
+          # para criptografar e descriptografar dados em repouso
+          - Sid: AllowS3AndDynamoDBServiceUse
+            Effect: Allow
+            Principal:
+              Service:
+                - s3.amazonaws.com        # S3 usa para SSE-KMS
+                - dynamodb.amazonaws.com  # DynamoDB usa para criptografia em repouso
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: '*'
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: storage
+
+  # Alias legível para a chave KMS — facilita identificação no console AWS
+  # Exemplo: alias/docsaas-key-simulation
+  KMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${ProjectName}-key-${Environment}
+      TargetKeyId: !Ref KMSKey  # Aponta para a chave criada acima
+
+  # ============================================================================
+  # RECURSO 2 — S3 Standard Bucket
+  # ============================================================================
+  # Bucket de armazenamento ativo — onde os documentos ficam nos primeiros 365 dias.
+  # O cliente faz upload diretamente aqui via Pre-signed URL gerada pela Lambda.
+  #
+  # Configurações de segurança:
+  #   - Block Public Access: completamente ativado (nenhum acesso público)
+  #   - Criptografia: SSE-KMS com a chave CMK criada acima
+  #   - Versionamento: ativado (preserva versões anteriores dos documentos)
+  #
+  # Lifecycle Policy:
+  #   - Após ArchiveDays (padrão 365), objetos são movidos para Glacier Deep Archive
+  #   - A transição é automática, sem custo adicional de Lambda para mover
+  #   - A Lambda Archive Trigger apenas atualiza o DynamoDB após a transição
+  # ============================================================================
+  S3StandardBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      # Nome do bucket — deve ser globalmente único na AWS
+      # O accountId garante unicidade entre contas diferentes
+      BucketName: !Sub ${ProjectName}-standard-${Environment}-${AWS::AccountId}
+
+      # Bloqueia qualquer forma de acesso público ao bucket
+      # Documentos só são acessíveis via Pre-signed URLs temporárias
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true        # Bloqueia ACLs públicas
+        BlockPublicPolicy: true      # Bloqueia políticas de bucket públicas
+        IgnorePublicAcls: true       # Ignora ACLs públicas existentes
+        RestrictPublicBuckets: true  # Restringe acesso público via políticas
+
+      # Versionamento — preserva versões anteriores de cada documento
+      # Útil para recuperar versões antigas e para auditoria
+      VersioningConfiguration:
+        Status: Enabled
+
+      # Criptografia server-side com KMS (SSE-KMS)
+      # Todos os objetos são criptografados automaticamente no upload
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms                    # Usa KMS (não AES-256)
+              KMSMasterKeyID: !GetAtt KMSKey.Arn       # Nossa chave CMK
+            BucketKeyEnabled: true  # Reduz custos de chamadas KMS
+
+      # Lifecycle Policy — automação de transição para Glacier após ArchiveDays dias
+      LifecycleConfiguration:
+        Rules:
+          - Id: !Sub TransitionToGlacierAfter${ArchiveDays}Days
+            Status: Enabled  # Regra ativa
+
+            # Aplica a regra a TODOS os objetos do bucket (prefixo vazio = tudo)
+            Prefix: ''
+
+            Transitions:
+              - TransitionInDays: !Ref ArchiveDays       # Padrão: 365 dias
+                StorageClass: DEEP_ARCHIVE               # Destino: Glacier Deep Archive
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: storage-standard
+
+  # ============================================================================
+  # RECURSO 3 — S3 Glacier Deep Archive Bucket
+  # ============================================================================
+  # Bucket de arquivo histórico — onde os documentos ficam após 365 dias.
+  # Documentos aqui têm custo de armazenamento muito baixo (~$0.00099/GB/mês)
+  # mas têm latência de recuperação de 12 a 48 horas (restore necessário).
+  #
+  # Para o TCC: se um documento estiver aqui e o utilizador pedir download,
+  # a Lambda retorna storageClass: GLACIER e downloadUrl: null,
+  # indicando que é necessário solicitar restore (fora do escopo do TCC).
+  #
+  # Mesma estrutura de prefixo do S3 Standard para consistência:
+  #   {tenantId}/{documentId}/{filename}
+  # ============================================================================
+  S3GlacierBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      # Nome do bucket Glacier
+      BucketName: !Sub ${ProjectName}-glacier-${Environment}-${AWS::AccountId}
+
+      # Bloqueia qualquer forma de acesso público — igual ao Standard
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+      # Criptografia SSE-KMS com a mesma chave CMK do bucket Standard
+      # Garante consistência de criptografia entre os dois buckets
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt KMSKey.Arn
+            BucketKeyEnabled: true
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: storage-glacier
+
+# ==============================================================================
+# OUTPUTS
+# Exporta os valores necessários para database.yaml e compute.yaml:
+#   - KMSKeyArn: usado pelo database.yaml para criptografar o DynamoDB
+#   - S3StandardBucketName: usado pelo compute.yaml para configurar as Lambdas
+#   - S3GlacierBucketName: usado pelo compute.yaml para configurar as Lambdas
+# ==============================================================================
+Outputs:
+
+  KMSKeyArn:
+    Description: ARN da chave KMS CMK — usado para criptografar DynamoDB e S3
+    Value: !GetAtt KMSKey.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-KMSKeyArn
+
+  KMSKeyId:
+    Description: ID da chave KMS CMK
+    Value: !Ref KMSKey
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-KMSKeyId
+
+  KMSKeyAlias:
+    Description: Alias legível da chave KMS
+    Value: !Ref KMSKeyAlias
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-KMSKeyAlias
+
+  S3StandardBucketName:
+    Description: Nome do bucket S3 Standard (armazenamento ativo 0-365 dias)
+    Value: !Ref S3StandardBucket  # !Ref em S3 Bucket retorna o nome
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-S3StandardBucket
+
+  S3StandardBucketArn:
+    Description: ARN do bucket S3 Standard
+    Value: !GetAtt S3StandardBucket.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-S3StandardBucketArn
+
+  S3GlacierBucketName:
+    Description: Nome do bucket S3 Glacier Deep Archive (arquivo histórico 365+ dias)
+    Value: !Ref S3GlacierBucket
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-S3GlacierBucket
+
+  S3GlacierBucketArn:
+    Description: ARN do bucket S3 Glacier Deep Archive
+    Value: !GetAtt S3GlacierBucket.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-S3GlacierBucketArn

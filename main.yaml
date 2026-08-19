@@ -1,0 +1,201 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  DocSaaS Infra TCC - Template raiz com nested stacks.
+  Orquestra todos os domínios da infraestrutura AWS para o SaaS de gestão de documentos.
+  Equipe CloudFormation - TCC.
+
+# ==============================================================================
+# PARÂMETROS
+# Valores configuráveis que permitem reutilizar este template em diferentes
+# ambientes sem alterar o código.
+# ==============================================================================
+Parameters:
+  Environment:
+    Type: String
+    Default: simulation
+    AllowedValues: [simulation, staging, production]
+    Description: Ambiente de execução (use 'simulation' para o TCC)
+
+  ProjectName:
+    Type: String
+    Default: docsaas
+    Description: Prefixo utilizado em todos os recursos AWS criados
+
+  RetentionDays:
+    Type: Number
+    Default: 30
+    Description: Período de retenção de logs no CloudWatch (dias)
+
+  ArchiveDays:
+    Type: Number
+    Default: 365
+    Description: Número de dias até os documentos serem movidos para Glacier Deep Archive
+
+  TemplatesBucketName:
+    Type: String
+    Description: Nome do bucket S3 onde os templates das nested stacks estão armazenados
+    Default: docsaas-cfn-templates
+
+# ==============================================================================
+# RESOURCES - NESTED STACKS
+# Cada stack corresponde a um domínio da arquitectura.
+# A ordem de criação respeita as dependências entre recursos.
+# ==============================================================================
+Resources:
+
+  # ----------------------------------------------------------------------------
+  # 1. IAM Stack — criada PRIMEIRO pois outros recursos dependem das roles
+  # ----------------------------------------------------------------------------
+  IAMStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://s3.amazonaws.com/${TemplatesBucketName}/templates/iam.yaml
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ----------------------------------------------------------------------------
+  # 2. Monitoring Stack — CloudWatch LogGroups e SNS Topic
+  #    Criada cedo para que as Lambdas possam referenciar os LogGroups
+  # ----------------------------------------------------------------------------
+  MonitoringStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://s3.amazonaws.com/${TemplatesBucketName}/templates/monitoring.yaml
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        RetentionDays: !Ref RetentionDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ----------------------------------------------------------------------------
+  # 3. Storage Stack — KMS Key, S3 Standard e S3 Glacier
+  #    Depende de IAMStack para a Role que acede aos buckets
+  # ----------------------------------------------------------------------------
+  StorageStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: IAMStack
+    Properties:
+      TemplateURL: !Sub https://s3.amazonaws.com/${TemplatesBucketName}/templates/storage.yaml
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        ArchiveDays: !Ref ArchiveDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ----------------------------------------------------------------------------
+  # 4. Database Stack — Tabela DynamoDB de metadados
+  #    GetAtt do storage.yaml já cria dependência implícita
+  # ----------------------------------------------------------------------------
+  DatabaseStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://s3.amazonaws.com/${TemplatesBucketName}/templates/database.yaml
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        KMSKeyArn: !GetAtt StorageStack.Outputs.KMSKeyArn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ----------------------------------------------------------------------------
+  # 5. Compute Stack — Funções Lambda
+  #    GetAtt dos outros stacks já cria dependências implícitas
+  # ----------------------------------------------------------------------------
+  ComputeStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://s3.amazonaws.com/${TemplatesBucketName}/templates/compute.yaml
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        S3StandardBucketName: !GetAtt StorageStack.Outputs.S3StandardBucketName
+        S3GlacierBucketName: !GetAtt StorageStack.Outputs.S3GlacierBucketName
+        DynamoDBTableName: !GetAtt DatabaseStack.Outputs.DynamoDBTableName
+        KMSKeyArn: !GetAtt StorageStack.Outputs.KMSKeyArn
+        SNSTopicArn: !GetAtt MonitoringStack.Outputs.SNSTopicArn
+        CloudWatchLogGroupName: !GetAtt MonitoringStack.Outputs.CloudWatchLogGroupName
+        LambdaAccessVerifierRoleArn: !GetAtt IAMStack.Outputs.LambdaAccessVerifierRoleArn
+        LambdaMetadataHandlerRoleArn: !GetAtt IAMStack.Outputs.LambdaMetadataHandlerRoleArn
+        LambdaArchiveTriggerRoleArn: !GetAtt IAMStack.Outputs.LambdaArchiveTriggerRoleArn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ----------------------------------------------------------------------------
+  # 6. API Stack — Amazon API Gateway
+  #    GetAtt do compute.yaml já cria dependência implícita
+  # ----------------------------------------------------------------------------
+  APIStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://s3.amazonaws.com/${TemplatesBucketName}/templates/api.yaml
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        LambdaAccessVerifierArn: !GetAtt ComputeStack.Outputs.LambdaAccessVerifierArn
+        LambdaMetadataHandlerArn: !GetAtt ComputeStack.Outputs.LambdaMetadataHandlerArn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+# ==============================================================================
+# OUTPUTS
+# Exporta os valores mais importantes para uso externo ou referência cruzada.
+# ==============================================================================
+Outputs:
+  KMSKeyArn:
+    Description: ARN da chave KMS Customer Managed Key
+    Value: !GetAtt StorageStack.Outputs.KMSKeyArn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-KMSKeyArn
+
+  SNSTopicArn:
+    Description: ARN do tópico SNS de eventos de documentos
+    Value: !GetAtt MonitoringStack.Outputs.SNSTopicArn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-SNSTopicArn
+
+  S3StandardBucketName:
+    Description: Nome do bucket S3 Standard (armazenamento activo)
+    Value: !GetAtt StorageStack.Outputs.S3StandardBucketName
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-S3StandardBucket
+
+  S3GlacierBucketName:
+    Description: Nome do bucket S3 Glacier Deep Archive (arquivo histórico)
+    Value: !GetAtt StorageStack.Outputs.S3GlacierBucketName
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-S3GlacierBucket
+
+  DynamoDBTableName:
+    Description: Nome da tabela DynamoDB de metadados de documentos
+    Value: !GetAtt DatabaseStack.Outputs.DynamoDBTableName
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-DynamoDBTable
+
+  APIGatewayURL:
+    Description: URL base do API Gateway (stage simulation)
+    Value: !GetAtt APIStack.Outputs.APIGatewayURL
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-APIGatewayURL

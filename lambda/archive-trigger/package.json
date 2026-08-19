@@ -1,0 +1,10 @@
+{
+  "name": "archive-trigger",
+  "version": "1.0.0",
+  "description": "Lambda acionada pelo S3 para atualizar DynamoDB após arquivamento no Glacier",
+  "main": "index.js",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.750.0",
+    "@aws-sdk/client-sns": "^3.750.0"
+  }
+}

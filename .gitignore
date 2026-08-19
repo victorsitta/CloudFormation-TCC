@@ -1,0 +1,9 @@
+# Dependências Node.js — não subir para o repositório
+node_modules/
+
+# Arquivos de ambiente — não subir credenciais
+.env
+
+# Arquivos do sistema
+.DS_Store
+Thumbs.db

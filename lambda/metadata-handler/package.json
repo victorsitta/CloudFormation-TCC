@@ -1,0 +1,10 @@
+{
+  "name": "metadata-handler",
+  "version": "1.0.0",
+  "description": "Lambda que faz CRUD de metadados no DynamoDB e publica eventos no SNS",
+  "main": "index.js",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.750.0",
+    "@aws-sdk/client-sns": "^3.750.0"
+  }
+}

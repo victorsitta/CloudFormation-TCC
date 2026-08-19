@@ -1,0 +1,149 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  DynamoDB Table de metadados — DocSaaS Infra TCC.
+  Armazena informacoes sobre os documentos: quem enviou, o que enviou,
+  onde esta no S3 e se foi deletado. Chave composta documentId+tenantId.
+  GSI TenantIndex para listagem por tenant. Criptografia KMS em repouso.
+
+# ==============================================================================
+# PARÂMETROS
+# Recebidos do main.yaml via nested stack
+# ==============================================================================
+Parameters:
+
+  Environment:
+    Type: String
+    Default: simulation
+    AllowedValues: [simulation, staging, production]
+    Description: Ambiente de execução
+
+  ProjectName:
+    Type: String
+    Default: docsaas
+    Description: Prefixo de todos os recursos
+
+  KMSKeyArn:
+    Type: String
+    Description: >
+      ARN da chave KMS CMK criada no storage.yaml.
+      Usado para criptografar os dados em repouso no DynamoDB.
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+Resources:
+
+  # ============================================================================
+  # RECURSO 1 — DynamoDB Table
+  # ============================================================================
+  # Tabela de metadados dos documentos. Cada item representa um documento
+  # e contém todas as informações necessárias para localizá-lo no S3.
+  #
+  # Schema de um item completo:
+  # {
+  #   "documentId":  "doc_01HK2XABCDEF",          ← Partition Key
+  #   "tenantId":    "tenant_acme_corp",            ← Sort Key
+  #   "userId":      "user_abc123",
+  #   "filename":    "contrato-2024.pdf",
+  #   "contentType": "application/pdf",
+  #   "sizeBytes":   1048576,
+  #   "uploadedAt":  "2024-03-15T14:30:00Z",
+  #   "storageClass":"STANDARD",                   ← STANDARD ou GLACIER
+  #   "s3Key":       "tenant_acme_corp/doc_01HK2XABCDEF/contrato-2024.pdf",
+  #   "deleted":     false                          ← false = ativo, true = deletado
+  # }
+  # ============================================================================
+  DocumentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      # Nome da tabela — deve ser idêntico ao referenciado no iam.yaml
+      # Exemplo: docsaas-documents-simulation
+      TableName: !Sub ${ProjectName}-documents-${Environment}
+
+      # Modo de faturamento PAY_PER_REQUEST (on-demand)
+      # Ideal para TCC: não há custo quando não há requisições
+      # Escala automaticamente com a demanda sem necessidade de provisionar capacidade
+      BillingMode: PAY_PER_REQUEST
+
+      # Definição dos atributos usados como chaves (primária e GSI)
+      # IMPORTANTE: No DynamoDB só se define os atributos usados em chaves aqui
+      # Os demais atributos (filename, contentType, etc.) são definidos no código
+      AttributeDefinitions:
+        - AttributeName: documentId  # Partition Key da tabela principal
+          AttributeType: S           # S = String
+        - AttributeName: tenantId    # Sort Key da tabela principal + Partition Key do GSI
+          AttributeType: S
+        - AttributeName: uploadedAt  # Sort Key do GSI — para ordenar por data
+          AttributeType: S
+
+      # Chave primária composta:
+      #   documentId (Partition Key) + tenantId (Sort Key)
+      # Permite acesso direto: "buscar documento X do tenant Y"
+      KeySchema:
+        - AttributeName: documentId
+          KeyType: HASH   # HASH = Partition Key
+        - AttributeName: tenantId
+          KeyType: RANGE  # RANGE = Sort Key
+
+      # Global Secondary Index (GSI) — TenantIndex
+      # Necessário para a operação de LISTAGEM de documentos por tenant
+      # Sem o GSI, não seria possível fazer Query eficiente por tenantId
+      #
+      # Permite a query: "liste todos os documentos do tenant X, ordenados por data"
+      # Usado pela Lambda Metadata Handler na operação GET /documents
+      GlobalSecondaryIndexes:
+        - IndexName: TenantIndex
+          KeySchema:
+            - AttributeName: tenantId    # Partition Key do GSI — busca por tenant
+              KeyType: HASH
+            - AttributeName: uploadedAt  # Sort Key do GSI — ordena por data de upload
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL  # ALL = inclui todos os atributos no índice (não só as chaves)
+
+      # Criptografia em repouso com KMS CMK
+      # O ARN da chave vem do storage.yaml via parâmetro KMSKeyArn
+      SSESpecification:
+        SSEEnabled: true          # Ativa criptografia em repouso
+        SSEType: KMS              # Usa KMS (não AES-256 padrão)
+        KMSMasterKeyId: !Ref KMSKeyArn  # Nossa chave CMK
+
+      # Point-in-Time Recovery (PITR)
+      # Permite restaurar a tabela para qualquer ponto nos últimos 35 dias
+      # Boa prática de segurança: proteção contra deleção acidental de metadados
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: database
+
+# ==============================================================================
+# OUTPUTS
+# Exporta os valores necessários para o compute.yaml:
+#   - DynamoDBTableName: usado pelas Lambdas para saber em qual tabela operar
+#   - DynamoDBTableArn:  usado pelo IAM para verificar permissões
+# ==============================================================================
+Outputs:
+
+  DynamoDBTableName:
+    Description: Nome da tabela DynamoDB de metadados dos documentos
+    Value: !Ref DocumentsTable  # !Ref em DynamoDB Table retorna o nome
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-DynamoDBTable
+
+  DynamoDBTableArn:
+    Description: ARN da tabela DynamoDB
+    Value: !GetAtt DocumentsTable.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-DynamoDBTableArn
+
+  DynamoDBGSIArn:
+    Description: ARN do GSI TenantIndex — usado para queries por tenant
+    Value: !Sub ${DocumentsTable.Arn}/index/TenantIndex
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-DynamoDBGSIArn

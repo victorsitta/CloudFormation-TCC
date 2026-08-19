@@ -1,0 +1,156 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  CloudWatch + SNS — DocSaaS Infra TCC
+  ======================================
+  Este template cria a camada de observabilidade e notificações do sistema.
+  É criado logo no início (segundo na ordem do main.yaml) porque as Lambdas
+  precisam do nome do Log Group e do ARN do SNS antes de serem criadas.
+
+  Recursos criados:
+    1. CloudWatch Log Group → centraliza todos os logs das Lambdas em JSON
+    2. SNS Topic            → canal de notificações de eventos de documentos
+
+  Quem usa estes recursos:
+    - Lambda Access Verifier  → escreve logs no CloudWatch
+    - Lambda Metadata Handler → escreve logs + publica UPLOADED/ERROR no SNS
+    - Lambda Archive Trigger  → escreve logs + publica ARCHIVED no SNS
+
+# ==============================================================================
+# PARÂMETROS
+# Recebidos do main.yaml via nested stack
+# ==============================================================================
+Parameters:
+
+  Environment:
+    Type: String
+    Default: simulation
+    AllowedValues: [simulation, staging, production]
+    Description: Ambiente de execução — usado como sufixo nos nomes dos recursos
+
+  ProjectName:
+    Type: String
+    Default: docsaas
+    Description: Prefixo de todos os recursos
+
+  RetentionDays:
+    Type: Number
+    Default: 30
+    Description: >
+      Número de dias que os logs ficam armazenados no CloudWatch.
+      Após este período, os logs são automaticamente apagados.
+      Padrão 30 dias é suficiente para demonstração do TCC.
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+Resources:
+
+  # ============================================================================
+  # RECURSO 1 — CloudWatch Log Group
+  # ============================================================================
+  # Centraliza todos os logs das 3 funções Lambda num único grupo.
+  # As Lambdas escrevem logs em formato JSON estruturado com os campos:
+  #   - timestamp:    data/hora da operação
+  #   - requestId:    ID único da requisição (rastreabilidade)
+  #   - tenantId:     tenant que realizou a operação
+  #   - userId:       utilizador que realizou a operação
+  #   - operation:    o que foi feito (GENERATE_UPLOAD_URL, CREATE_METADATA, etc.)
+  #   - documentId:   documento envolvido na operação
+  #   - status:       APPROVED, DENIED, SUCCESS, ERROR
+  #   - errorMessage: presente apenas em caso de erro
+  #
+  # O nome /aws/lambda/${ProjectName}-${Environment} é o padrão AWS para
+  # log groups de Lambdas — facilita a visualização no console AWS.
+  # ============================================================================
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      # Nome do grupo de logs — padrão AWS para Lambdas
+      # Exemplo: /aws/lambda/docsaas-simulation
+      LogGroupName: !Sub /aws/lambda/${ProjectName}-${Environment}
+
+      # Retenção automática — após RetentionDays dias, os logs são apagados
+      # Evita acúmulo desnecessário de logs em ambiente de simulação
+      RetentionInDays: !Ref RetentionDays
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: monitoring
+
+  # ============================================================================
+  # RECURSO 2 — SNS Topic
+  # ============================================================================
+  # Canal de notificações de eventos do sistema.
+  # As Lambdas publicam mensagens aqui quando algo acontece com um documento.
+  #
+  # Eventos publicados:
+  #   UPLOADED → publicado pela Lambda Metadata Handler após criar metadado
+  #     { "event": "UPLOADED", "tenantId": "...", "documentId": "...", "uploadedAt": "..." }
+  #
+  #   ARCHIVED → publicado pela Lambda Archive Trigger após transição para Glacier
+  #     { "event": "ARCHIVED", "tenantId": "...", "documentId": "...", "archivedAt": "..." }
+  #
+  #   ERROR → publicado por qualquer Lambda em caso de erro crítico
+  #     { "event": "ERROR", "tenantId": "...", "documentId": "...", "errorMessage": "..." }
+  #
+  # Subscribers possíveis (configurados fora deste template):
+  #   - Backend Node.js da equipe MVP (via HTTP endpoint ou SQS)
+  #   - Email de notificação (para demonstração no TCC)
+  #
+  # IMPORTANTE: O nome do tópico DEVE ser ${ProjectName}-events-${Environment}
+  # pois é o nome referenciado nas políticas IAM do iam.yaml
+  # ============================================================================
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      # Nome do tópico — deve ser idêntico ao referenciado no iam.yaml
+      # Exemplo: docsaas-events-simulation
+      TopicName: !Sub ${ProjectName}-events-${Environment}
+
+      # DisplayName aparece como remetente nas notificações por email
+      DisplayName: !Sub DocSaaS ${Environment} - Eventos de Documentos
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: monitoring
+
+# ==============================================================================
+# OUTPUTS
+# Exporta os valores necessários para outros templates:
+#   - compute.yaml precisa do SNSTopicArn para configurar as Lambdas
+#   - compute.yaml precisa do CloudWatchLogGroupName para configurar os logs
+#   - main.yaml exporta estes valores como outputs globais da stack
+# ==============================================================================
+Outputs:
+
+  SNSTopicArn:
+    Description: ARN do tópico SNS — usado pelas Lambdas para publicar eventos
+    Value: !Ref SNSTopic  # !Ref em um SNS Topic retorna o ARN
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-SNSTopicArn
+
+  SNSTopicName:
+    Description: Nome do tópico SNS
+    Value: !GetAtt SNSTopic.TopicName
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-SNSTopicName
+
+  CloudWatchLogGroupName:
+    Description: Nome do Log Group CloudWatch — usado pelas Lambdas para escrever logs
+    Value: !Ref LambdaLogGroup  # !Ref em um Log Group retorna o nome
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-LogGroupName
+
+  CloudWatchLogGroupArn:
+    Description: ARN do Log Group CloudWatch
+    Value: !GetAtt LambdaLogGroup.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-LogGroupArn

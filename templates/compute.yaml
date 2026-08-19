@@ -1,0 +1,353 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Funções Lambda — DocSaaS Infra TCC
+  =====================================
+  Este template cria as 3 funções Lambda do sistema.
+  É o quinto a ser criado porque depende de todos os outros recursos:
+    - IAM Roles (iam.yaml)
+    - Log Group e SNS Topic (monitoring.yaml)
+    - S3 Buckets e KMS Key (storage.yaml)
+    - DynamoDB Table (database.yaml)
+
+  Funções Lambda criadas:
+    1. access-verifier   → valida JWT e gera Pre-signed URLs para S3
+    2. metadata-handler  → CRUD de metadados no DynamoDB
+    3. archive-trigger   → atualiza DynamoDB após transição para Glacier
+
+  Fluxo de invocação:
+    API Gateway → access-verifier  (upload/download)
+    API Gateway → metadata-handler (listar/deletar documentos)
+    S3 Event    → archive-trigger  (acionada automaticamente pela Lifecycle Policy)
+
+  NOTA SOBRE O CÓDIGO LAMBDA:
+    O código das Lambdas está inline neste template (ZipFile) para simplificar
+    o deploy no TCC. Em produção, o código seria empacotado em um arquivo .zip
+    e armazenado no S3, referenciado via S3Bucket e S3Key.
+
+# ==============================================================================
+# PARÂMETROS
+# Recebidos do main.yaml via nested stack — todos os ARNs e nomes necessários
+# ==============================================================================
+Parameters:
+
+  Environment:
+    Type: String
+    Default: simulation
+    AllowedValues: [simulation, staging, production]
+
+  ProjectName:
+    Type: String
+    Default: docsaas
+
+  # Recursos de armazenamento (do storage.yaml)
+  S3StandardBucketName:
+    Type: String
+    Description: Nome do bucket S3 Standard
+
+  S3GlacierBucketName:
+    Type: String
+    Description: Nome do bucket S3 Glacier Deep Archive
+
+  KMSKeyArn:
+    Type: String
+    Description: ARN da chave KMS CMK
+
+  # Recursos de base de dados (do database.yaml)
+  DynamoDBTableName:
+    Type: String
+    Description: Nome da tabela DynamoDB de metadados
+
+  # Recursos de monitorização (do monitoring.yaml)
+  SNSTopicArn:
+    Type: String
+    Description: ARN do tópico SNS para publicação de eventos
+
+  CloudWatchLogGroupName:
+    Type: String
+    Description: Nome do Log Group CloudWatch
+
+  # IAM Roles (do iam.yaml)
+  LambdaAccessVerifierRoleArn:
+    Type: String
+    Description: ARN da Role IAM da Lambda Access Verifier
+
+  LambdaMetadataHandlerRoleArn:
+    Type: String
+    Description: ARN da Role IAM da Lambda Metadata Handler
+
+  LambdaArchiveTriggerRoleArn:
+    Type: String
+    Description: ARN da Role IAM da Lambda Archive Trigger
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+Resources:
+
+  # ============================================================================
+  # LAMBDA 1 — Access Verifier
+  # ============================================================================
+  # Esta Lambda é o ponto de entrada para operações de upload e download.
+  # Ela recebe a requisição do API Gateway, valida o JWT e gera Pre-signed URLs.
+  #
+  # Endpoints que a invocam:
+  #   POST /documents/upload-url   → gera URL de upload
+  #   GET  /documents/download-url/{documentId} → gera URL de download
+  #
+  # Fluxo de upload:
+  #   1. Extrai tenantId e userId do JWT
+  #   2. Gera um documentId único
+  #   3. Constrói s3Key = {tenantId}/{documentId}/{filename}
+  #   4. Gera Pre-signed URL para PUT no S3 Standard (válida 900s)
+  #   5. Retorna { uploadUrl, documentId, expiresIn: 900 }
+  #
+  # Fluxo de download:
+  #   1. Extrai tenantId do JWT
+  #   2. Consulta DynamoDB pelo documentId para obter storageClass e s3Key
+  #   3. Verifica se tenantId do JWT == tenantId do documento (tenant mismatch)
+  #   4. Gera Pre-signed URL para GET no bucket correto (Standard ou Glacier)
+  #   5. Retorna { downloadUrl, storageClass, expiresIn: 900 }
+  # ============================================================================
+  LambdaAccessVerifier:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-${Environment}-access-verifier
+      Description: Valida JWT e gera Pre-signed URLs para upload e download no S3
+
+      # Runtime Node.js 20.x — LTS atual, suportado pela AWS Lambda
+      Runtime: nodejs24.x
+      Handler: index.handler  # arquivo index.js, função handler exportada
+
+      # Role IAM que esta Lambda assume — criada no iam.yaml
+      Role: !Ref LambdaAccessVerifierRoleArn
+
+      # Timeout de 30 segundos — suficiente para validar JWT e gerar URL
+      Timeout: 30
+
+      # 256MB de memória — suficiente para operações leves de JWT e S3
+      MemorySize: 256
+
+      # Variáveis de ambiente — injetadas automaticamente pelo CloudFormation
+      # A Lambda lê estas variáveis via process.env.VARIABLE_NAME
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+          S3_STANDARD_BUCKET: !Ref S3StandardBucketName    # Nome do bucket Standard
+          S3_GLACIER_BUCKET: !Ref S3GlacierBucketName      # Nome do bucket Glacier
+          DYNAMODB_TABLE: !Ref DynamoDBTableName            # Nome da tabela DynamoDB
+          KMS_KEY_ARN: !Ref KMSKeyArn                       # ARN da chave KMS
+          SNS_TOPIC_ARN: !Ref SNSTopicArn                   # ARN do tópico SNS
+          LOG_GROUP_NAME: !Ref CloudWatchLogGroupName       # Nome do Log Group
+          PRESIGNED_URL_EXPIRY: '900'                       # Validade da Pre-signed URL em segundos
+
+      # Código inline da Lambda — para deploy simplificado no TCC
+      # O arquivo completo está em lambda/access-verifier/index.js
+      Code:
+        ZipFile: |
+          // Lambda Access Verifier — DocSaaS Infra TCC
+          // Código completo em: lambda/access-verifier/index.js
+          exports.handler = async (event) => {
+            console.log(JSON.stringify({ message: 'access-verifier invoked', event }));
+            return { statusCode: 200, body: JSON.stringify({ message: 'access-verifier placeholder' }) };
+          };
+
+      # Configuração de logs — aponta para o Log Group criado no monitoring.yaml
+      LoggingConfig:
+        LogGroup: !Ref CloudWatchLogGroupName
+        LogFormat: JSON  # Logs estruturados em JSON para facilitar análise
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: access-verifier
+
+  # Permissão para o API Gateway invocar esta Lambda
+  # Sem esta permissão, o API Gateway receberia AccessDenied ao tentar invocar
+  LambdaAccessVerifierApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt LambdaAccessVerifier.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com  # Quem pode invocar: API Gateway
+      # SourceArn vazio aqui — o api.yaml vai restringir o ARN específico
+      # Para o TCC, qualquer API Gateway da conta pode invocar
+
+  # ============================================================================
+  # LAMBDA 2 — Metadata Handler
+  # ============================================================================
+  # Esta Lambda gerencia o ciclo de vida dos metadados dos documentos.
+  # É responsável pelo CRUD na tabela DynamoDB.
+  #
+  # Endpoints que a invocam:
+  #   POST   /documents/upload-url  → cria metadado após upload (chamada interna)
+  #   GET    /documents             → lista documentos do tenant
+  #   DELETE /documents/{id}        → eliminação lógica (deleted=true)
+  #
+  # Operações DynamoDB:
+  #   PutItem:    cria novo metadado com storageClass=STANDARD e deleted=false
+  #   Query:      lista documentos por tenantId via GSI TenantIndex
+  #   UpdateItem: eliminação lógica — atualiza deleted=true
+  #   GetItem:    busca metadado específico por documentId+tenantId
+  # ============================================================================
+  LambdaMetadataHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-${Environment}-metadata-handler
+      Description: CRUD de metadados de documentos no DynamoDB + publicação de eventos SNS
+
+      Runtime: nodejs24.x
+      Handler: index.handler
+
+      Role: !Ref LambdaMetadataHandlerRoleArn
+
+      # Timeout maior pois pode fazer múltiplas operações DynamoDB + SNS
+      Timeout: 30
+      MemorySize: 256
+
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+          DYNAMODB_TABLE: !Ref DynamoDBTableName      # Tabela de metadados
+          DYNAMODB_GSI_NAME: TenantIndex              # Nome do GSI para queries por tenant
+          SNS_TOPIC_ARN: !Ref SNSTopicArn             # Para publicar UPLOADED e ERROR
+          LOG_GROUP_NAME: !Ref CloudWatchLogGroupName
+
+      Code:
+        ZipFile: |
+          // Lambda Metadata Handler — DocSaaS Infra TCC
+          // Código completo em: lambda/metadata-handler/index.js
+          exports.handler = async (event) => {
+            console.log(JSON.stringify({ message: 'metadata-handler invoked', event }));
+            return { statusCode: 200, body: JSON.stringify({ message: 'metadata-handler placeholder' }) };
+          };
+
+      LoggingConfig:
+        LogGroup: !Ref CloudWatchLogGroupName
+        LogFormat: JSON
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: metadata-handler
+
+  # Permissão para o API Gateway invocar esta Lambda
+  LambdaMetadataHandlerApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt LambdaMetadataHandler.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+
+  # ============================================================================
+  # LAMBDA 3 — Archive Trigger
+  # ============================================================================
+  # Esta Lambda é acionada automaticamente pelo S3 quando a Lifecycle Policy
+  # move um objeto do S3 Standard para o S3 Glacier Deep Archive (após 365 dias).
+  #
+  # Diferente das outras Lambdas, esta NÃO é invocada pelo API Gateway.
+  # É invocada por um evento S3 (S3 Event Notification).
+  #
+  # Fluxo:
+  #   1. S3 Lifecycle Policy move objeto para Glacier (automático)
+  #   2. S3 envia evento para esta Lambda com o bucket e key do objeto
+  #   3. Lambda extrai tenantId e documentId do s3Key ({tenantId}/{documentId}/...)
+  #   4. Lambda atualiza DynamoDB: storageClass → "GLACIER"
+  #   5. Lambda publica evento ARCHIVED no SNS
+  # ============================================================================
+  LambdaArchiveTrigger:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-${Environment}-archive-trigger
+      Description: Atualiza metadados no DynamoDB e publica evento ARCHIVED no SNS após transição para Glacier
+
+      Runtime: nodejs24.x
+      Handler: index.handler
+
+      Role: !Ref LambdaArchiveTriggerRoleArn
+
+      # Timeout de 60 segundos — pode processar múltiplos objetos em lote
+      Timeout: 60
+      MemorySize: 128  # Menos memória pois só faz UpdateItem + SNS Publish
+
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+          DYNAMODB_TABLE: !Ref DynamoDBTableName  # Para atualizar storageClass
+          SNS_TOPIC_ARN: !Ref SNSTopicArn         # Para publicar ARCHIVED
+          LOG_GROUP_NAME: !Ref CloudWatchLogGroupName
+
+      Code:
+        ZipFile: |
+          // Lambda Archive Trigger — DocSaaS Infra TCC
+          // Código completo em: lambda/archive-trigger/index.js
+          exports.handler = async (event) => {
+            console.log(JSON.stringify({ message: 'archive-trigger invoked', event }));
+            return { statusCode: 200, body: JSON.stringify({ message: 'archive-trigger placeholder' }) };
+          };
+
+      LoggingConfig:
+        LogGroup: !Ref CloudWatchLogGroupName
+        LogFormat: JSON
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: archive-trigger
+
+  # Permissão para o S3 invocar esta Lambda quando um objeto for arquivado
+  # O S3 Standard Bucket vai notificar esta Lambda via S3 Event Notification
+  LambdaArchiveTriggerS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt LambdaArchiveTrigger.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com  # Quem pode invocar: S3
+      SourceArn: !Sub arn:aws:s3:::${S3StandardBucketName}  # Apenas este bucket específico
+
+# ==============================================================================
+# OUTPUTS
+# Exporta os ARNs das Lambdas para o api.yaml criar as integrações do API Gateway
+# ==============================================================================
+Outputs:
+
+  LambdaAccessVerifierArn:
+    Description: ARN da Lambda Access Verifier — usado pelo api.yaml para integração
+    Value: !GetAtt LambdaAccessVerifier.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-AccessVerifierArn
+
+  LambdaAccessVerifierName:
+    Description: Nome da Lambda Access Verifier
+    Value: !Ref LambdaAccessVerifier
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-AccessVerifierName
+
+  LambdaMetadataHandlerArn:
+    Description: ARN da Lambda Metadata Handler — usado pelo api.yaml para integração
+    Value: !GetAtt LambdaMetadataHandler.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-MetadataHandlerArn
+
+  LambdaMetadataHandlerName:
+    Description: Nome da Lambda Metadata Handler
+    Value: !Ref LambdaMetadataHandler
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-MetadataHandlerName
+
+  LambdaArchiveTriggerArn:
+    Description: ARN da Lambda Archive Trigger — acionada por eventos S3
+    Value: !GetAtt LambdaArchiveTrigger.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ArchiveTriggerArn
