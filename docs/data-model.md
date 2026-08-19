@@ -1,156 +1,205 @@
-# Modelo de Dados
+# Data Model
 
-## DynamoDB — Tabela de Metadados
+---
 
-### Estrutura da Tabela
+## DynamoDB — Documents Table
 
-**Nome**: `docsaas-documents-{environment}`
+**Table name:** `docsaas-documents-{environment}`
 
-| Atributo | Tipo | Papel | Descrição |
-|----------|------|-------|-----------|
-| `documentId` | String (S) | Partition Key | Identificador único do documento (ex: `doc_01HK2X...`) |
-| `tenantId` | String (S) | Sort Key | Identificador do tenant proprietário |
-| `userId` | String (S) | — | Identificador do utilizador que fez o upload |
-| `filename` | String (S) | — | Nome original do ficheiro |
-| `contentType` | String (S) | — | MIME type (ex: `application/pdf`) |
-| `sizeBytes` | Number (N) | — | Tamanho do ficheiro em bytes |
-| `uploadedAt` | String (S) | — | ISO 8601 timestamp do upload |
-| `storageClass` | String (S) | — | `STANDARD` ou `GLACIER` |
-| `s3Key` | String (S) | — | Chave S3 completa: `{tenantId}/{documentId}/{filename}` |
-| `deleted` | Boolean (BOOL) | — | Flag de eliminação lógica |
+**Billing mode:** PAY_PER_REQUEST (on-demand)
 
-### Exemplo de Item
+**Encryption:** AWS KMS Customer Managed Key (CMK)
+
+**Point-in-Time Recovery:** Enabled (35-day window)
+
+### Primary Key
+
+| Attribute | Type | Role |
+|-----------|------|------|
+| `documentId` | String | Partition Key |
+| `tenantId` | String | Sort Key |
+
+### Attributes
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `documentId` | String | Unique document identifier (e.g. `doc_ABC123`) |
+| `tenantId` | String | Tenant that owns the document |
+| `userId` | String | User who uploaded the document |
+| `filename` | String | Original filename |
+| `contentType` | String | MIME type (e.g. `application/pdf`) |
+| `sizeBytes` | Number | File size in bytes |
+| `uploadedAt` | String | ISO 8601 upload timestamp |
+| `storageClass` | String | `STANDARD` or `GLACIER` |
+| `s3Key` | String | Full S3 object key: `{tenantId}/{documentId}/{filename}` |
+| `deleted` | Boolean | Logical deletion flag |
+| `deletedAt` | String | ISO 8601 deletion timestamp (set on delete) |
+| `deletedBy` | String | userId who performed the deletion (set on delete) |
+| `archivedAt` | String | ISO 8601 archival timestamp (set when moved to Glacier) |
+
+### Item Example
 
 ```json
 {
-  "documentId": "doc_01HK2XABCDEF",
+  "documentId": "doc_ABC123",
   "tenantId": "tenant_acme_corp",
-  "userId": "user_abc123",
-  "filename": "contrato-2024.pdf",
+  "userId": "user_xyz789",
+  "filename": "contract-2024.pdf",
   "contentType": "application/pdf",
   "sizeBytes": 1048576,
-  "uploadedAt": "2024-03-15T14:30:00Z",
+  "uploadedAt": "2024-03-15T14:30:00.000Z",
   "storageClass": "STANDARD",
-  "s3Key": "tenant_acme_corp/doc_01HK2XABCDEF/contrato-2024.pdf",
+  "s3Key": "tenant_acme_corp/doc_ABC123/contract-2024.pdf",
   "deleted": false
 }
 ```
 
-### Padrões de Acesso
+### Global Secondary Index — TenantIndex
 
-| Operação | Tipo de Query | Parâmetros |
-|----------|---------------|------------|
-| Obter metadado por documentId | GetItem | `documentId` + `tenantId` |
-| Listar documentos do tenant | Query | `tenantId` (GSI) + `deleted = false` |
-| Criar metadado | PutItem | Item completo |
-| Eliminação lógica | UpdateItem | `documentId` + `tenantId` → `deleted = true` |
-| Actualizar storageClass | UpdateItem | `documentId` + `tenantId` → `storageClass = GLACIER` |
+Enables efficient queries to list all documents belonging to a tenant.
 
-### Global Secondary Index (GSI)
+| Attribute | Role |
+|-----------|------|
+| `tenantId` | Partition Key |
+| `uploadedAt` | Sort Key |
 
-Para suportar queries por tenant, é necessário um GSI:
+**Projection:** ALL (includes all attributes)
 
-**Nome**: `TenantIndex`
-- Partition Key: `tenantId`
-- Sort Key: `uploadedAt`
-- Projection: ALL
+**Query pattern:** `tenantId = :tenantId AND deleted = false`, sorted by `uploadedAt` descending.
 
-Isto permite listar todos os documentos de um tenant ordenados por data de upload.
+### Access Patterns
+
+| Operation | DynamoDB Action | Key Used |
+|-----------|----------------|----------|
+| Get document metadata | `GetItem` | `documentId` + `tenantId` |
+| List tenant documents | `Query` on TenantIndex | `tenantId` |
+| Create document metadata | `PutItem` | Full item |
+| Logical delete | `UpdateItem` | `documentId` + `tenantId` |
+| Update storage class to GLACIER | `UpdateItem` | `documentId` + `tenantId` |
 
 ---
 
-## S3 — Estrutura de Objectos
+## S3 — Object Storage
 
-### S3 Standard Bucket
+### Standard Bucket
 
-**Nome**: `docsaas-standard-{environment}-{accountId}`
+**Name:** `docsaas-standard-{environment}-{accountId}`
 
-**Estrutura de prefixo**:
+**Purpose:** Active document storage (0–365 days)
+
+**Configuration:**
+- Encryption: SSE-KMS with CMK
+- Versioning: Enabled
+- Block Public Access: All options enabled
+- Lifecycle Policy: Transition to Glacier Deep Archive after 365 days
+
+**Key structure:**
 ```
-{tenantId}/
-  {documentId}/
-    {filename}
+{tenantId}/{documentId}/{filename}
 ```
 
-**Exemplo**:
+**Example:**
 ```
 tenant_acme_corp/
-  doc_01HK2XABCDEF/
-    contrato-2024.pdf
-  doc_01HK2XGHIJKL/
-    relatorio-anual.pdf
+  doc_ABC123/
+    contract-2024.pdf
+  doc_DEF456/
+    annual-report.pdf
 
 tenant_startup_xyz/
-  doc_01HK2XMNOPQR/
-    proposta-comercial.docx
+  doc_GHI789/
+    proposal.docx
 ```
 
-**Configurações**:
-- Encriptação: SSE-KMS (KMS_Key CMK)
-- Versionamento: Activado
-- Block Public Access: Activado completamente
-- Lifecycle Policy: Transição para Glacier após 365 dias
+### Glacier Bucket
 
-### S3 Glacier Deep Archive Bucket
+**Name:** `docsaas-glacier-{environment}-{accountId}`
 
-**Nome**: `docsaas-glacier-{environment}-{accountId}`
+**Purpose:** Historical document archival (365+ days)
 
-**Estrutura de prefixo**: Idêntica ao S3 Standard (mantida para consistência)
+**Configuration:**
+- Encryption: SSE-KMS with the same CMK as Standard bucket
+- Block Public Access: All options enabled
+- Storage class: Glacier Deep Archive
 
-**Configurações**:
-- Encriptação: SSE-KMS (KMS_Key CMK)
-- Block Public Access: Activado completamente
-- Classe de armazenamento: GLACIER_DEEP_ARCHIVE
+**Key structure:** Identical to Standard bucket (preserves path consistency)
+
+> Documents in Glacier Deep Archive require a restore request before they can be downloaded. Restore time is 12–48 hours. This operation is outside the scope of this project.
 
 ---
 
-## KMS — Chave de Encriptação
+## KMS — Encryption Key
 
-**Alias**: `alias/docsaas-key-{environment}`
+**Key alias:** `alias/docsaas-key-{environment}`
 
-**Tipo**: Symmetric, ENCRYPT_DECRYPT
+**Key spec:** SYMMETRIC_DEFAULT (AES-256)
 
-**Usos**:
-- Encriptação de objectos S3 Standard (SSE-KMS)
-- Encriptação de objectos S3 Glacier (SSE-KMS)
-- Encriptação em repouso DynamoDB
+**Key usage:** ENCRYPT_DECRYPT
 
-**Rotação**: Automática anual
+**Rotation:** Annual automatic rotation enabled
+
+**Used by:**
+- S3 Standard bucket — server-side encryption (SSE-KMS)
+- S3 Glacier bucket — server-side encryption (SSE-KMS)
+- DynamoDB table — encryption at rest
+
+**Key policy principals:**
+- AWS account root (administrative access)
+- S3 service (`s3.amazonaws.com`) — via `kms:ViaService` condition
+- DynamoDB service (`dynamodb.amazonaws.com`) — via `kms:ViaService` condition
 
 ---
 
-## Fluxo de Dados por Operação
+## Data Flow
 
-### Upload
-
-```
-1. Cliente → API Gateway (POST /documents/upload-url)
-   Body: { filename, contentType, sizeBytes }
-   Header: Authorization: Bearer {JWT}
-
-2. API Gateway → Lambda Access Verifier
-   Passa: JWT + body da requisição
-
-3. Lambda Access Verifier:
-   a. Extrai tenantId e userId do JWT
-   b. Gera documentId único
-   c. Constrói s3Key = {tenantId}/{documentId}/{filename}
-   d. Gera Pre-signed URL para s3Key no S3 Standard (TTL: 900s)
-   e. Retorna { uploadUrl, documentId, expiresIn: 900 }
-
-4. Cliente → S3 Standard (upload directo via Pre-signed URL)
-
-5. S3 Standard → Lambda Metadata Handler (via evento S3 ou chamada directa)
-   Lambda cria item no DynamoDB com storageClass: "STANDARD"
-   Lambda publica evento UPLOADED no SNS
-```
-
-### Arquivamento (automático após 365 dias)
+### Upload Flow
 
 ```
-1. S3 Lifecycle Policy detecta objecto com 365+ dias
-2. S3 move objecto para S3 Glacier Deep Archive
-3. Lambda Archive Trigger é invocada:
-   a. Actualiza DynamoDB: storageClass → "GLACIER"
-   b. Publica evento ARCHIVED no SNS
+1. MVP Backend → POST /documents/upload-url
+   Payload: { filename, contentType, sizeBytes }
+
+2. Lambda access-verifier:
+   - Decodes JWT → extracts tenantId, userId
+   - Generates documentId
+   - Constructs s3Key = {tenantId}/{documentId}/{filename}
+   - Generates S3 pre-signed PUT URL (TTL: 900s)
+   - Returns: { uploadUrl, documentId, s3Key, expiresIn }
+
+3. MVP Backend → PUT {uploadUrl} (direct to S3, binary body)
+
+4. MVP Backend → POST /documents
+   Payload: { documentId, filename, contentType, sizeBytes, s3Key }
+
+5. Lambda metadata-handler:
+   - Creates DynamoDB item: storageClass=STANDARD, deleted=false
+   - Publishes UPLOADED event to SNS
+```
+
+### Download Flow
+
+```
+1. MVP Backend → GET /documents/download-url/{documentId}
+
+2. Lambda access-verifier:
+   - Decodes JWT → extracts tenantId
+   - Queries DynamoDB: GetItem by documentId + tenantId
+   - Validates tenant ownership (tenant mismatch check)
+   - Checks storageClass:
+     - STANDARD → generates S3 pre-signed GET URL (TTL: 900s)
+     - GLACIER  → returns { downloadUrl: null, restoreStatus: REQUIRED }
+```
+
+### Archival Flow (automatic)
+
+```
+1. S3 Lifecycle Policy detects objects older than 365 days
+2. S3 transitions objects to Glacier Deep Archive automatically
+
+3. S3 triggers Lambda archive-trigger with event:
+   { s3.bucket.name, s3.object.key }
+
+4. Lambda archive-trigger:
+   - Extracts tenantId, documentId from s3Key
+   - DynamoDB UpdateItem: storageClass=GLACIER, archivedAt=now
+   - Publishes ARCHIVED event to SNS
 ```

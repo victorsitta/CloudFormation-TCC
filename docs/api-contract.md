@@ -1,53 +1,67 @@
-# Contrato da API
+# API Reference
 
-## Visão Geral
+**Base URL:** `https://{api-id}.execute-api.{region}.amazonaws.com/simulation`
 
-O API Gateway expõe 4 endpoints REST no stage `simulation`. Todos os endpoints requerem o header `Authorization: Bearer {JWT}` onde o JWT é emitido pelo Supabase Auth.
-
-**Base URL**: `https://{api-id}.execute-api.{region}.amazonaws.com/simulation`
+All endpoints require a Supabase-issued JWT in the `Authorization` header. The JWT must contain a custom `tenantId` claim configured by the MVP team in Supabase Auth.
 
 ---
 
-## Autenticação
+## Authentication
 
-Todos os endpoints requerem o header:
+**Header required on all requests:**
 ```
-Authorization: Bearer {JWT_do_Supabase}
+Authorization: Bearer {jwt_token}
 ```
 
-O JWT deve conter os claims:
-- `sub`: userId
-- `tenantId`: identificador do tenant (claim customizado adicionado pela equipe MVP)
+**Required JWT claims:**
+| Claim | Description |
+|-------|-------------|
+| `sub` | User ID (standard JWT subject) |
+| `tenantId` | Tenant identifier (custom claim — must be configured in Supabase Auth) |
 
 ---
 
 ## Endpoints
 
-### 1. Gerar URL de Upload
+### POST /documents/upload-url
 
-**POST** `/documents/upload-url`
+Generates a pre-signed S3 URL for direct file upload. The client must use this URL to upload the file directly to S3 — the file does not pass through the API.
 
-Gera uma Pre-signed URL para upload directo ao S3.
+**Request**
 
-**Request Body**:
+```http
+POST /documents/upload-url
+Authorization: Bearer {token}
+Content-Type: application/json
+```
+
 ```json
 {
-  "filename": "relatorio-anual.pdf",
+  "filename": "annual-report.pdf",
   "contentType": "application/pdf",
   "sizeBytes": 2048576
 }
 ```
 
-**Response 200**:
+**Response 200**
 ```json
 {
-  "uploadUrl": "https://s3.amazonaws.com/docsaas-standard-{env}/...",
-  "documentId": "doc_01HK2X...",
+  "uploadUrl": "https://s3.amazonaws.com/docsaas-standard-simulation-{accountId}/tenant_acme/doc_ABC123/annual-report.pdf?X-Amz-...",
+  "documentId": "doc_ABC123",
+  "s3Key": "tenant_acme/doc_ABC123/annual-report.pdf",
   "expiresIn": 900
 }
 ```
 
-**Response 401** — JWT ausente ou malformado:
+**Response 400** — Missing required fields
+```json
+{
+  "error": "Bad Request",
+  "message": "filename and contentType are required"
+}
+```
+
+**Response 401** — Missing Authorization header
 ```json
 {
   "error": "Unauthorized",
@@ -55,7 +69,7 @@ Gera uma Pre-signed URL para upload directo ao S3.
 }
 ```
 
-**Response 403** — Token inválido ou expirado:
+**Response 403** — Invalid or expired token
 ```json
 {
   "error": "Forbidden",
@@ -63,66 +77,79 @@ Gera uma Pre-signed URL para upload directo ao S3.
 }
 ```
 
----
-
-### 2. Gerar URL de Download
-
-**GET** `/documents/download-url/{documentId}`
-
-Gera uma Pre-signed URL para download directo do S3 (Standard ou Glacier).
-
-**Path Parameters**:
-- `documentId` (string): Identificador do documento
-
-**Response 200**:
-```json
-{
-  "downloadUrl": "https://s3.amazonaws.com/...",
-  "storageClass": "STANDARD",
-  "expiresIn": 900
-}
-```
-
-**Response 403** — Tenant mismatch:
-```json
-{
-  "error": "Forbidden",
-  "message": "Access denied: tenant mismatch"
-}
-```
-
-**Response 404** — Documento não encontrado:
-```json
-{
-  "error": "Not Found",
-  "message": "Document not found"
-}
-```
-
-**Nota sobre Glacier**: Se o documento estiver em Glacier Deep Archive, o campo `downloadUrl` será `null` e a resposta incluirá `"restoreStatus": "REQUIRED"`. Restore de Glacier não está no escopo do TCC.
+> After uploading the file to S3, call `POST /documents` to register the document metadata.
 
 ---
 
-### 3. Listar Documentos do Tenant
+### POST /documents
 
-**GET** `/documents`
+Registers document metadata in DynamoDB after a successful S3 upload. Must be called after the file has been uploaded to S3 using the pre-signed URL.
 
-Lista todos os documentos activos do tenant autenticado.
+**Request**
 
-**Query Parameters** (opcionais):
-- `limit` (number): Máximo de resultados (padrão: 20, máximo: 100)
-- `nextToken` (string): Token de paginação
+```http
+POST /documents
+Authorization: Bearer {token}
+Content-Type: application/json
+```
 
-**Response 200**:
+```json
+{
+  "documentId": "doc_ABC123",
+  "filename": "annual-report.pdf",
+  "contentType": "application/pdf",
+  "sizeBytes": 2048576,
+  "s3Key": "tenant_acme/doc_ABC123/annual-report.pdf"
+}
+```
+
+**Response 201**
+```json
+{
+  "message": "Document metadata created successfully",
+  "documentId": "doc_ABC123",
+  "uploadedAt": "2024-03-15T14:30:00.000Z"
+}
+```
+
+**Response 400** — Missing required fields
+```json
+{
+  "error": "Bad Request",
+  "message": "documentId, filename, contentType and s3Key are required"
+}
+```
+
+---
+
+### GET /documents
+
+Returns all active (non-deleted) documents belonging to the authenticated tenant. Supports pagination.
+
+**Request**
+
+```http
+GET /documents?limit=20&nextToken={token}
+Authorization: Bearer {token}
+```
+
+**Query Parameters**
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `limit` | number | No | 20 | Maximum results per page (max: 100) |
+| `nextToken` | string | No | — | Pagination cursor from previous response |
+
+**Response 200**
 ```json
 {
   "documents": [
     {
-      "documentId": "doc_01HK2X...",
-      "filename": "relatorio-anual.pdf",
+      "documentId": "doc_ABC123",
+      "filename": "annual-report.pdf",
       "contentType": "application/pdf",
       "sizeBytes": 2048576,
-      "uploadedAt": "2024-01-15T10:30:00Z",
+      "uploadedAt": "2024-03-15T14:30:00.000Z",
       "storageClass": "STANDARD"
     }
   ],
@@ -131,26 +158,47 @@ Lista todos os documentos activos do tenant autenticado.
 }
 ```
 
+> `storageClass` will be `STANDARD` for active documents and `GLACIER` for documents archived after 365 days.
+
 ---
 
-### 4. Eliminação Lógica de Documento
+### GET /documents/download-url/{documentId}
 
-**DELETE** `/documents/{documentId}`
+Generates a pre-signed S3 URL for direct file download. If the document is in Glacier Deep Archive, the URL will be `null` and a restore will be required.
 
-Marca um documento como eliminado (eliminação lógica — o ficheiro permanece no S3).
+**Request**
 
-**Path Parameters**:
-- `documentId` (string): Identificador do documento
+```http
+GET /documents/download-url/{documentId}
+Authorization: Bearer {token}
+```
 
-**Response 200**:
+**Path Parameters**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `documentId` | string | Yes | Document identifier |
+
+**Response 200 — Standard storage**
 ```json
 {
-  "message": "Document marked as deleted",
-  "documentId": "doc_01HK2X..."
+  "downloadUrl": "https://s3.amazonaws.com/docsaas-standard-simulation-{accountId}/...",
+  "storageClass": "STANDARD",
+  "expiresIn": 900
 }
 ```
 
-**Response 403** — Tenant mismatch:
+**Response 200 — Glacier Deep Archive**
+```json
+{
+  "downloadUrl": null,
+  "storageClass": "GLACIER",
+  "restoreStatus": "REQUIRED",
+  "message": "Document is archived in Glacier Deep Archive. Restore required (12-48h)."
+}
+```
+
+**Response 403** — Tenant mismatch (cross-tenant access attempt)
 ```json
 {
   "error": "Forbidden",
@@ -158,50 +206,111 @@ Marca um documento como eliminado (eliminação lógica — o ficheiro permanece
 }
 ```
 
----
-
-## Códigos de Erro
-
-| Código | Situação |
-|--------|----------|
-| 400 | Request body inválido ou parâmetros em falta |
-| 401 | JWT ausente ou malformado |
-| 403 | JWT inválido/expirado ou tenant mismatch |
-| 404 | Documento não encontrado |
-| 500 | Erro interno (Lambda, DynamoDB ou KMS) |
+**Response 404** — Document not found or deleted
+```json
+{
+  "error": "Not Found",
+  "message": "Document not found"
+}
+```
 
 ---
 
-## Eventos SNS
+### DELETE /documents/{documentId}
 
-Após operações bem-sucedidas, a infra publica eventos no SNS Topic.
+Performs a logical deletion — marks the document as deleted in DynamoDB. The file remains in S3 for audit and compliance purposes.
 
-### Evento UPLOADED
+**Request**
+
+```http
+DELETE /documents/{documentId}
+Authorization: Bearer {token}
+```
+
+**Path Parameters**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `documentId` | string | Yes | Document identifier |
+
+**Response 200**
+```json
+{
+  "message": "Document marked as deleted",
+  "documentId": "doc_ABC123"
+}
+```
+
+**Response 403** — Tenant mismatch
+```json
+{
+  "error": "Forbidden",
+  "message": "Access denied: tenant mismatch"
+}
+```
+
+**Response 404** — Document not found
+```json
+{
+  "error": "Not Found",
+  "message": "Document not found"
+}
+```
+
+---
+
+## HTTP Status Codes
+
+| Code | Meaning |
+|------|---------|
+| 200 | Success |
+| 201 | Created |
+| 400 | Invalid request body or missing parameters |
+| 401 | Missing or malformed Authorization header |
+| 403 | Invalid/expired token or cross-tenant access attempt |
+| 404 | Document not found or logically deleted |
+| 500 | Internal server error (Lambda, DynamoDB, or KMS failure) |
+
+---
+
+## SNS Events
+
+After successful operations, the infrastructure publishes events to the SNS topic. The MVP backend can subscribe to receive real-time notifications.
+
+**Topic ARN:** Available in CloudFormation stack outputs as `SNSTopicArn`.
+
+### UPLOADED
+Published when document metadata is created successfully.
 ```json
 {
   "event": "UPLOADED",
-  "tenantId": "tenant_123",
-  "documentId": "doc_01HK2X...",
-  "uploadedAt": "2024-01-15T10:30:00Z"
+  "tenantId": "tenant_acme",
+  "documentId": "doc_ABC123",
+  "uploadedAt": "2024-03-15T14:30:00.000Z",
+  "timestamp": "2024-03-15T14:30:00.000Z"
 }
 ```
 
-### Evento ARCHIVED
+### ARCHIVED
+Published when a document is automatically transitioned to Glacier Deep Archive after 365 days.
 ```json
 {
   "event": "ARCHIVED",
-  "tenantId": "tenant_123",
-  "documentId": "doc_01HK2X...",
-  "archivedAt": "2025-01-15T00:00:00Z"
+  "tenantId": "tenant_acme",
+  "documentId": "doc_ABC123",
+  "archivedAt": "2025-03-15T00:00:00.000Z",
+  "timestamp": "2025-03-15T00:00:00.000Z"
 }
 ```
 
-### Evento ERROR
+### ERROR
+Published when any Lambda encounters a critical error.
 ```json
 {
   "event": "ERROR",
-  "tenantId": "tenant_123",
-  "documentId": "doc_01HK2X...",
-  "errorMessage": "DynamoDB write failed: ..."
+  "tenantId": "tenant_acme",
+  "documentId": "doc_ABC123",
+  "errorMessage": "DynamoDB UpdateItem failed: ...",
+  "timestamp": "2024-03-15T14:30:00.000Z"
 }
 ```
