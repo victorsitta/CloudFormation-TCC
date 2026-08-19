@@ -1,177 +1,173 @@
-# DocSaaS Infrastructure
+<div align="center">
 
-Serverless AWS infrastructure for a multi-tenant document management SaaS, provisioned entirely via AWS CloudFormation.
+# 🗂️ DocSaaS Infrastructure
 
----
+**Serverless AWS infrastructure for a multi-tenant document management SaaS**
 
-## Overview
+[![CloudFormation](https://img.shields.io/badge/AWS-CloudFormation-FF9900?style=for-the-badge&logo=amazon-aws&logoColor=white)](https://aws.amazon.com/cloudformation/)
+[![Lambda](https://img.shields.io/badge/AWS-Lambda-FF9900?style=for-the-badge&logo=aws-lambda&logoColor=white)](https://aws.amazon.com/lambda/)
+[![Node.js](https://img.shields.io/badge/Node.js-24.x-339933?style=for-the-badge&logo=node.js&logoColor=white)](https://nodejs.org/)
+[![License](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)](LICENSE)
 
-This repository contains the AWS infrastructure layer of the DocSaaS platform. It provides secure document storage, retrieval, and lifecycle management for multiple tenant organizations through a serverless architecture.
+*Trabalho de Conclusão de Curso — Infraestrutura AWS provisionada via IaC*
 
-The platform is developed across two independent teams:
-
-| Team | Stack | Responsibility |
-|------|-------|---------------|
-| **MVP / Application** | React, Node.js, Supabase Auth, PostgreSQL | Frontend, business logic, authentication, account management |
-| **Infrastructure** (this repo) | CloudFormation, Lambda, S3, DynamoDB, API Gateway, KMS, IAM, CloudWatch, SNS | Document storage, access control, archival, event notifications |
+</div>
 
 ---
 
-## Architecture
+## 📌 Overview
+
+This repository contains the **AWS infrastructure layer** of the DocSaaS platform — a multi-tenant document management SaaS. The entire infrastructure is defined as code using AWS CloudFormation and follows a fully serverless architecture.
+
+> The platform is split across two independent teams. This repository covers the **infrastructure side only**.
+
+| Team | Stack | Scope |
+|------|-------|-------|
+| **MVP / Application** | React · Node.js · Supabase | Frontend, business rules, authentication |
+| **Infrastructure** *(this repo)* | CloudFormation · Lambda · S3 · DynamoDB | Storage, access control, archival, notifications |
+
+---
+
+## 🏗️ Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  MVP Application Layer                                       │
-│  React (frontend) → Node.js/Express (backend) → Supabase    │
-└──────────────────────────────┬───────────────────────────────┘
-                               │ HTTPS + JWT
-                               ▼
-┌──────────────────────────────────────────────────────────────┐
-│  AWS Infrastructure Layer (this repository)                  │
-│                                                              │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │  Amazon API Gateway  (REST — stage: simulation)     │    │
-│  │  POST /documents/upload-url                         │    │
-│  │  GET  /documents/download-url/{documentId}          │    │
-│  │  GET  /documents                                    │    │
-│  │  DELETE /documents/{documentId}                     │    │
-│  └───────────────┬──────────────────┬──────────────────┘    │
-│                  │                  │                        │
-│      ┌───────────▼──────┐  ┌────────▼─────────────┐        │
-│      │ Lambda           │  │ Lambda               │        │
-│      │ access-verifier  │  │ metadata-handler     │        │
-│      │ (JWT + URLs)     │  │ (DynamoDB CRUD)      │        │
-│      └────────┬─────────┘  └────────┬─────────────┘        │
-│               │                     │                       │
-│      ┌────────▼──────┐     ┌─────────▼──────────┐          │
-│      │  AWS KMS CMK  │     │  Amazon DynamoDB    │          │
-│      │  (encryption) │     │  (metadata)         │          │
-│      └────────┬──────┘     └────────────────────┘          │
-│               │                                             │
-│      ┌────────▼────────────────────────────────┐           │
-│      │  Amazon S3 Standard  (0–365 days)        │           │
-│      │  {tenantId}/{documentId}/{filename}       │           │
-│      └────────────────────┬────────────────────┘           │
-│                  Lifecycle │ Policy (365 days)              │
-│      ┌────────────────────▼────────────────────┐           │
-│      │  Amazon S3 Glacier Deep Archive (365d+)  │           │
-│      └────────────────────┬────────────────────┘           │
-│                           │ S3 Event                       │
-│                 ┌──────────▼──────────┐                    │
-│                 │ Lambda              │──→ Amazon SNS       │
-│                 │ archive-trigger     │    (ARCHIVED event) │
-│                 └─────────────────────┘                    │
-│                                                             │
-│  Amazon CloudWatch Logs  ·  AWS IAM Roles                  │
-└─────────────────────────────────────────────────────────────┘
+╔══════════════════════════════════════════════════════════════╗
+║              MVP Application Layer                           ║
+║   React  ──▶  Node.js / Express  ──▶  Supabase Auth + DB    ║
+╚══════════════════════════╦═══════════════════════════════════╝
+                           ║  HTTPS · JWT
+                           ▼
+╔══════════════════════════════════════════════════════════════╗
+║              AWS Infrastructure Layer  (this repo)           ║
+║                                                              ║
+║  ┌──────────────────────────────────────────────────────┐   ║
+║  │            Amazon API Gateway  (REST)                 │   ║
+║  │  POST /documents/upload-url                           │   ║
+║  │  GET  /documents/download-url/{id}                    │   ║
+║  │  GET  /documents                                      │   ║
+║  │  DELETE /documents/{id}                               │   ║
+║  └────────────┬─────────────────────┬────────────────────┘   ║
+║               │                     │                        ║
+║   ┌───────────▼──────────┐ ┌────────▼──────────────┐        ║
+║   │  λ access-verifier   │ │  λ metadata-handler   │        ║
+║   │  JWT · Pre-signed URL│ │  DynamoDB CRUD · SNS  │        ║
+║   └───────────┬──────────┘ └────────┬──────────────┘        ║
+║               │                     │                        ║
+║   ┌───────────▼──────┐   ┌──────────▼──────────────┐        ║
+║   │   AWS KMS  (CMK) │   │   Amazon DynamoDB        │        ║
+║   │   Encryption     │   │   Document Metadata      │        ║
+║   └───────────┬──────┘   └─────────────────────────┘        ║
+║               │                                              ║
+║   ┌───────────▼──────────────────────────────────────┐      ║
+║   │   Amazon S3 Standard   (0 – 365 days)             │      ║
+║   │   {tenantId}/{documentId}/{filename}               │      ║
+║   └───────────────────────┬──────────────────────────┘      ║
+║                 Lifecycle  │  Policy  →  365 days            ║
+║   ┌───────────────────────▼──────────────────────────┐      ║
+║   │   Amazon S3 Glacier Deep Archive  (365d+)         │      ║
+║   └───────────────────────┬──────────────────────────┘      ║
+║                     S3 Event │                               ║
+║              ┌──────────────▼────────────┐                  ║
+║              │  λ archive-trigger        │──▶  Amazon SNS   ║
+║              │  DynamoDB · SNS           │     (ARCHIVED)   ║
+║              └───────────────────────────┘                  ║
+║                                                              ║
+║   Amazon CloudWatch Logs  ·  AWS IAM Roles                  ║
+╚══════════════════════════════════════════════════════════════╝
 ```
 
 ---
 
-## Infrastructure Components
+## ⚙️ Infrastructure Components
 
 | Service | Resource | Purpose |
 |---------|----------|---------|
-| Amazon API Gateway | REST API — 4 routes | Single entry point for the MVP backend |
-| AWS Lambda | `access-verifier` | Validates JWT and generates S3 pre-signed URLs |
-| AWS Lambda | `metadata-handler` | DynamoDB CRUD — create, list, logical delete |
-| AWS Lambda | `archive-trigger` | Updates DynamoDB after S3 → Glacier transition |
-| Amazon S3 | `docsaas-standard-*` | Active document storage (0–365 days) |
-| Amazon S3 | `docsaas-glacier-*` | Historical archive (365+ days, Glacier Deep Archive) |
-| Amazon DynamoDB | `docsaas-documents-*` | Document metadata store |
-| AWS KMS | Customer Managed Key | Encryption at rest for S3 and DynamoDB |
-| AWS IAM | 3 Lambda roles | Least-privilege access control |
-| Amazon CloudWatch | Log Group (30-day retention) | Structured JSON logs from all Lambda functions |
-| Amazon SNS | Events topic | Document lifecycle notifications (UPLOADED, ARCHIVED, ERROR) |
+| 🌐 **API Gateway** | REST API · 4 routes | Single entry point for the MVP backend |
+| ⚡ **Lambda** | `access-verifier` | JWT validation + S3 pre-signed URL generation |
+| ⚡ **Lambda** | `metadata-handler` | Document metadata CRUD + SNS event publishing |
+| ⚡ **Lambda** | `archive-trigger` | Updates DynamoDB on S3 → Glacier transition |
+| 🗄️ **S3 Standard** | `docsaas-standard-*` | Active document storage (0–365 days) |
+| 🧊 **S3 Glacier** | `docsaas-glacier-*` | Long-term archive (365+ days, ~95% cheaper) |
+| 📊 **DynamoDB** | `docsaas-documents-*` | Document metadata (filename, owner, location) |
+| 🔐 **KMS** | Customer Managed Key | Encryption at rest — S3 + DynamoDB |
+| 🛡️ **IAM** | 3 Lambda roles | Least-privilege access control per function |
+| 📋 **CloudWatch** | Log Group (30d) | Structured JSON logs from all Lambda functions |
+| 📣 **SNS** | Events topic | Lifecycle notifications — UPLOADED · ARCHIVED · ERROR |
 
 ---
 
-## Repository Structure
+## 📁 Repository Structure
 
 ```
 .
-├── main.yaml                        # Root template — orchestrates all nested stacks
+├── 📄 main.yaml                    # Root template — orchestrates all nested stacks
 │
-├── templates/
-│   ├── iam.yaml                     # Lambda IAM roles and policies
-│   ├── monitoring.yaml              # CloudWatch Log Group + SNS Topic
-│   ├── storage.yaml                 # KMS CMK + S3 Standard + S3 Glacier
-│   ├── database.yaml                # DynamoDB table and GSI
-│   ├── compute.yaml                 # Lambda functions
-│   └── api.yaml                     # API Gateway REST API and routes
+├── 📂 templates/
+│   ├── iam.yaml                    # Lambda IAM roles and policies          [stack 1]
+│   ├── monitoring.yaml             # CloudWatch Log Group + SNS Topic        [stack 2]
+│   ├── storage.yaml                # KMS CMK + S3 Standard + S3 Glacier      [stack 3]
+│   ├── database.yaml               # DynamoDB table and GSI                  [stack 4]
+│   ├── compute.yaml                # Lambda functions (Node.js 24.x)         [stack 5]
+│   └── api.yaml                    # API Gateway REST API and routes         [stack 6]
 │
-├── lambda/
+├── 📂 lambda/
 │   ├── access-verifier/
-│   │   ├── index.js                 # JWT validation + S3 pre-signed URL generation
+│   │   ├── index.js                # JWT validation + pre-signed URL logic
 │   │   ├── package.json
 │   │   └── README.md
 │   ├── metadata-handler/
-│   │   ├── index.js                 # Document metadata CRUD + SNS events
+│   │   ├── index.js                # DynamoDB CRUD + SNS event publishing
 │   │   ├── package.json
 │   │   └── README.md
 │   ├── archive-trigger/
-│   │   ├── index.js                 # DynamoDB update on S3 → Glacier transition
+│   │   ├── index.js                # storageClass update on Glacier transition
 │   │   ├── package.json
 │   │   └── README.md
-│   └── test-local.js                # Local test script (no AWS required)
+│   └── test-local.js               # Local test script — no AWS required
 │
-├── docs/
-│   ├── architecture.md              # Architecture Decision Records (ADR)
-│   ├── api-contract.md              # API reference — endpoints, schemas, examples
-│   ├── data-model.md                # DynamoDB schema, S3 key structure, data flows
-│   ├── security.md                  # Security model, IAM roles, audit logging
-│   └── simulation-guide.md          # Deployment guide and local testing instructions
+├── 📂 docs/
+│   ├── architecture.md             # Architecture Decision Records (ADR)
+│   ├── api-contract.md             # Full API reference
+│   ├── data-model.md               # DynamoDB schema + S3 structure
+│   ├── security.md                 # Security model + IAM + audit logging
+│   └── simulation-guide.md         # Deployment guide + local testing
 │
-├── .env.example                     # Environment variable reference for the MVP team
+├── .env.example                    # Environment variable reference (MVP team)
 └── README.md
 ```
 
 ---
 
-## CloudFormation Stack Dependencies
+## 🔗 Stack Dependency Chain
 
-The `main.yaml` root template creates nested stacks in the following order based on output dependencies:
+The `main.yaml` root template provisions nested stacks in strict dependency order:
 
 ```
 main.yaml
-├── 1. iam.yaml         ← no dependencies
-├── 2. monitoring.yaml  ← no dependencies
-├── 3. storage.yaml     ← outputs: KMSKeyArn, S3 bucket names
-├── 4. database.yaml    ← requires: KMSKeyArn (from storage)
-├── 5. compute.yaml     ← requires: all IAM roles, S3 names, DynamoDB name, SNS ARN
-└── 6. api.yaml         ← requires: Lambda ARNs (from compute)
+ │
+ ├─▶ [1] iam.yaml          no upstream dependencies
+ ├─▶ [2] monitoring.yaml   no upstream dependencies
+ ├─▶ [3] storage.yaml      outputs → KMSKeyArn · S3BucketNames
+ ├─▶ [4] database.yaml     requires → KMSKeyArn
+ ├─▶ [5] compute.yaml      requires → IAM Roles · S3 · DynamoDB · SNS · CloudWatch
+ └─▶ [6] api.yaml          requires → Lambda ARNs
 ```
 
 ---
 
-## CloudFormation Parameters
+## 🚀 Quick Start
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `Environment` | String | `simulation` | Deployment environment — used as resource name suffix |
-| `ProjectName` | String | `docsaas` | Project prefix applied to all resource names |
-| `RetentionDays` | Number | `30` | CloudWatch log retention period in days |
-| `ArchiveDays` | Number | `365` | Days until S3 objects transition to Glacier Deep Archive |
-| `TemplatesBucketName` | String | `docsaas-cfn-templates` | S3 bucket hosting the nested stack templates |
+### Prerequisites
 
----
+```bash
+# Python + cfn-lint for template validation
+pip install cfn-lint
 
-## CloudFormation Outputs
+# Node.js 18+ for local Lambda tests
+node --version
+```
 
-| Output Key | Description |
-|-----------|-------------|
-| `APIGatewayURL` | Base URL for the MVP backend integration |
-| `SNSTopicArn` | ARN for subscribing to document lifecycle events |
-| `S3StandardBucketName` | Active storage bucket name |
-| `S3GlacierBucketName` | Archive storage bucket name |
-| `DynamoDBTableName` | Document metadata table name |
-| `KMSKeyArn` | Encryption key ARN |
-
----
-
-## Quick Start
-
-### Validate templates (no AWS account required)
+### 1 — Validate all templates *(no AWS account required)*
 
 ```bash
 cfn-lint templates/iam.yaml \
@@ -183,20 +179,20 @@ cfn-lint templates/iam.yaml \
          main.yaml
 ```
 
-### Run local Lambda tests (no AWS account required)
+### 2 — Run local Lambda tests *(no AWS account required)*
 
 ```bash
 node lambda/test-local.js
 ```
 
-### Deploy to AWS
+### 3 — Deploy to AWS *(Free Tier eligible)*
 
 ```bash
-# 1. Create a bucket to host nested stack templates
+# Create a bucket to host nested stack templates
 aws s3 mb s3://docsaas-cfn-templates-{your-name}
 aws s3 cp templates/ s3://docsaas-cfn-templates-{your-name}/templates/ --recursive
 
-# 2. Deploy the stack
+# Deploy the full stack
 aws cloudformation create-stack \
   --stack-name docsaas-simulation \
   --template-body file://main.yaml \
@@ -206,38 +202,74 @@ aws cloudformation create-stack \
     ParameterKey=ProjectName,ParameterValue=docsaas \
     ParameterKey=TemplatesBucketName,ParameterValue=docsaas-cfn-templates-{your-name}
 
-# 3. Retrieve stack outputs after CREATE_COMPLETE
+# Retrieve outputs after CREATE_COMPLETE (~3–5 min)
 aws cloudformation describe-stacks \
   --stack-name docsaas-simulation \
   --query 'Stacks[0].Outputs'
 
-# 4. Tear down (prevents ongoing KMS charges)
+# Tear down to avoid ongoing KMS charges
 aws cloudformation delete-stack --stack-name docsaas-simulation
 ```
 
 ---
 
-## Multi-Tenant Isolation
+## 🔒 Multi-Tenant Isolation
 
-Documents are stored with an explicit tenant-scoped key prefix in S3:
+Every document is stored with an explicit tenant-scoped S3 key prefix:
 
 ```
 {tenantId}/{documentId}/{filename}
 
-tenant_acme/doc_ABC123/contract-2024.pdf
-tenant_xyz/doc_DEF456/proposal.docx
+  tenant_acme/doc_ABC123/contract-2024.pdf     ← Acme only
+  tenant_xyz/doc_DEF456/proposal.docx          ← XYZ only
 ```
 
-The `access-verifier` Lambda extracts the `tenantId` from the JWT and scopes all generated pre-signed URLs to that tenant's prefix. Cross-tenant access is rejected at the application layer (HTTP 403) and enforced by IAM role conditions at the AWS layer.
+The `access-verifier` Lambda extracts `tenantId` from the JWT and scopes all pre-signed URLs to that tenant's prefix. Cross-tenant access is rejected at the application layer (`HTTP 403`) and enforced independently by IAM role conditions at the AWS layer.
 
 ---
 
-## Documentation
+## 📊 CloudFormation Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `Environment` | `simulation` | Deployment stage — appended to all resource names |
+| `ProjectName` | `docsaas` | Project prefix applied to all resource names |
+| `RetentionDays` | `30` | CloudWatch log retention period (days) |
+| `ArchiveDays` | `365` | Days until S3 objects transition to Glacier |
+| `TemplatesBucketName` | `docsaas-cfn-templates` | S3 bucket hosting nested stack templates |
+
+---
+
+## 💰 Cost Estimate
+
+| Service | Free Tier | Demo Cost |
+|---------|-----------|-----------|
+| Lambda | 1M requests/month | **$0.00** |
+| API Gateway | 1M calls/month | **$0.00** |
+| DynamoDB | 25 GB + 25 WCU/RCU | **$0.00** |
+| S3 Standard | 5 GB | **$0.00** |
+| CloudWatch | 5 GB logs | **$0.00** |
+| SNS | 1M publishes/month | **$0.00** |
+| **KMS CMK** | — | **~$1.00/month** |
+
+> ⚠️ The KMS Customer Managed Key is the only resource with a fixed monthly cost. Run `aws cloudformation delete-stack` after the demo to stop all charges.
+
+---
+
+## 📚 Documentation
 
 | Document | Description |
 |----------|-------------|
-| [`docs/architecture.md`](docs/architecture.md) | Architecture Decision Records (ADR) |
-| [`docs/api-contract.md`](docs/api-contract.md) | Full API reference with request/response schemas |
-| [`docs/data-model.md`](docs/data-model.md) | DynamoDB schema, S3 structure, data flow diagrams |
-| [`docs/security.md`](docs/security.md) | Security model, IAM roles, audit logging |
-| [`docs/simulation-guide.md`](docs/simulation-guide.md) | Deployment guide and local testing instructions |
+| [`docs/architecture.md`](docs/architecture.md) | Architecture Decision Records (ADR) — rationale behind every design choice |
+| [`docs/api-contract.md`](docs/api-contract.md) | Full API reference — endpoints, request/response schemas, SNS events |
+| [`docs/data-model.md`](docs/data-model.md) | DynamoDB schema, S3 key structure, data flow diagrams |
+| [`docs/security.md`](docs/security.md) | Security model, IAM roles, encryption, audit logging |
+| [`docs/simulation-guide.md`](docs/simulation-guide.md) | Step-by-step deployment and local testing guide |
+
+---
+
+<div align="center">
+
+*Built with ❤️ for academic purposes — TCC · AWS CloudFormation · Serverless*
+
+</div>
