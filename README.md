@@ -1,47 +1,47 @@
 <div align="center">
 
-# 🗂️ DocSaaS Infrastructure
+# 🗂️ DocSaaS — Infraestrutura AWS
 
-**Serverless AWS infrastructure for a multi-tenant document management SaaS**
+**Infraestrutura serverless na AWS para um SaaS de gestão de documentos multi-tenant**
 
 [![CloudFormation](https://img.shields.io/badge/AWS-CloudFormation-FF9900?style=for-the-badge&logo=amazon-aws&logoColor=white)](https://aws.amazon.com/cloudformation/)
 [![Lambda](https://img.shields.io/badge/AWS-Lambda-FF9900?style=for-the-badge&logo=aws-lambda&logoColor=white)](https://aws.amazon.com/lambda/)
 [![Node.js](https://img.shields.io/badge/Node.js-24.x-339933?style=for-the-badge&logo=node.js&logoColor=white)](https://nodejs.org/)
-[![License](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)](LICENSE)
+[![License](https://img.shields.io/badge/Licença-MIT-blue?style=for-the-badge)](LICENSE)
 
-*Trabalho de Conclusão de Curso — Infraestrutura AWS provisionada via IaC*
+*Trabalho de Conclusão de Curso — Infraestrutura AWS provisionada via IaC (CloudFormation)*
 
 </div>
 
 ---
 
-## 📌 Overview
+## 📌 Visão Geral
 
-This repository contains the **AWS infrastructure layer** of the DocSaaS platform — a multi-tenant document management SaaS. The entire infrastructure is defined as code using AWS CloudFormation and follows a fully serverless architecture.
+Este repositório contém a **camada de infraestrutura AWS** da plataforma DocSaaS — um SaaS de gestão de documentos multi-tenant. Toda a infraestrutura é definida como código usando AWS CloudFormation e segue uma arquitetura completamente serverless.
 
-> The platform is split across two independent teams. This repository covers the **infrastructure side only**.
+> A plataforma é desenvolvida por duas equipes independentes. Este repositório cobre **apenas a camada de infraestrutura**.
 
-| Team | Stack | Scope |
-|------|-------|-------|
-| **MVP / Application** | React · Node.js · Supabase | Frontend, business rules, authentication |
-| **Infrastructure** *(this repo)* | CloudFormation · Lambda · S3 · DynamoDB | Storage, access control, archival, notifications |
+| Equipe | Stack | Responsabilidade |
+|--------|-------|-----------------|
+| **MVP / Aplicação** | React · Node.js · Supabase | Frontend, regras de negócio, autenticação |
+| **Infraestrutura** *(este repo)* | CloudFormation · Lambda · S3 · DynamoDB | Armazenamento, controle de acesso, arquivamento, notificações |
 
 ---
 
-## 🏗️ Architecture
+## 🏗️ Arquitetura
 
 ```
 ╔══════════════════════════════════════════════════════════════╗
-║              MVP Application Layer                           ║
+║              Camada MVP / Aplicação                          ║
 ║   React  ──▶  Node.js / Express  ──▶  Supabase Auth + DB    ║
 ╚══════════════════════════╦═══════════════════════════════════╝
                            ║  HTTPS · JWT
                            ▼
 ╔══════════════════════════════════════════════════════════════╗
-║              AWS Infrastructure Layer  (this repo)           ║
+║         Camada de Infraestrutura AWS  (este repositório)     ║
 ║                                                              ║
 ║  ┌──────────────────────────────────────────────────────┐   ║
-║  │            Amazon API Gateway  (REST)                 │   ║
+║  │          Amazon API Gateway  (REST)                   │   ║
 ║  │  POST /documents/upload-url                           │   ║
 ║  │  GET  /documents/download-url/{id}                    │   ║
 ║  │  GET  /documents                                      │   ║
@@ -55,21 +55,21 @@ This repository contains the **AWS infrastructure layer** of the DocSaaS platfor
 ║               │                     │                        ║
 ║   ┌───────────▼──────┐   ┌──────────▼──────────────┐        ║
 ║   │   AWS KMS  (CMK) │   │   Amazon DynamoDB        │        ║
-║   │   Encryption     │   │   Document Metadata      │        ║
+║   │   Criptografia   │   │   Metadados              │        ║
 ║   └───────────┬──────┘   └─────────────────────────┘        ║
 ║               │                                              ║
 ║   ┌───────────▼──────────────────────────────────────┐      ║
-║   │   Amazon S3 Standard   (0 – 365 days)             │      ║
+║   │   Amazon S3 Standard   (0 – 365 dias)             │      ║
 ║   │   {tenantId}/{documentId}/{filename}               │      ║
 ║   └───────────────────────┬──────────────────────────┘      ║
-║                 Lifecycle  │  Policy  →  365 days            ║
+║              Lifecycle Policy → 365 dias                     ║
 ║   ┌───────────────────────▼──────────────────────────┐      ║
 ║   │   Amazon S3 Glacier Deep Archive  (365d+)         │      ║
 ║   └───────────────────────┬──────────────────────────┘      ║
-║                     S3 Event │                               ║
+║                   Evento S3 │                                ║
 ║              ┌──────────────▼────────────┐                  ║
 ║              │  λ archive-trigger        │──▶  Amazon SNS   ║
-║              │  DynamoDB · SNS           │     (ARCHIVED)   ║
+║              │  DynamoDB · SNS           │    (ARCHIVED)    ║
 ║              └───────────────────────────┘                  ║
 ║                                                              ║
 ║   Amazon CloudWatch Logs  ·  AWS IAM Roles                  ║
@@ -78,96 +78,96 @@ This repository contains the **AWS infrastructure layer** of the DocSaaS platfor
 
 ---
 
-## ⚙️ Infrastructure Components
+## ⚙️ Componentes de Infraestrutura
 
-| Service | Resource | Purpose |
-|---------|----------|---------|
-| 🌐 **API Gateway** | REST API · 4 routes | Single entry point for the MVP backend |
-| ⚡ **Lambda** | `access-verifier` | JWT validation + S3 pre-signed URL generation |
-| ⚡ **Lambda** | `metadata-handler` | Document metadata CRUD + SNS event publishing |
-| ⚡ **Lambda** | `archive-trigger` | Updates DynamoDB on S3 → Glacier transition |
-| 🗄️ **S3 Standard** | `docsaas-standard-*` | Active document storage (0–365 days) |
-| 🧊 **S3 Glacier** | `docsaas-glacier-*` | Long-term archive (365+ days, ~95% cheaper) |
-| 📊 **DynamoDB** | `docsaas-documents-*` | Document metadata (filename, owner, location) |
-| 🔐 **KMS** | Customer Managed Key | Encryption at rest — S3 + DynamoDB |
-| 🛡️ **IAM** | 3 Lambda roles | Least-privilege access control per function |
-| 📋 **CloudWatch** | Log Group (30d) | Structured JSON logs from all Lambda functions |
-| 📣 **SNS** | Events topic | Lifecycle notifications — UPLOADED · ARCHIVED · ERROR |
+| Serviço | Recurso | Finalidade |
+|---------|---------|-----------|
+| 🌐 **API Gateway** | REST API · 4 rotas | Ponto de entrada para o backend MVP |
+| ⚡ **Lambda** | `access-verifier` | Validação de JWT + geração de Pre-signed URLs |
+| ⚡ **Lambda** | `metadata-handler` | CRUD de metadados no DynamoDB + eventos SNS |
+| ⚡ **Lambda** | `archive-trigger` | Atualiza DynamoDB após transição S3 → Glacier |
+| 🗄️ **S3 Standard** | `docsaas-standard-*` | Armazenamento ativo de documentos (0–365 dias) |
+| 🧊 **S3 Glacier** | `docsaas-glacier-*` | Arquivo histórico (365+ dias, ~95% mais barato) |
+| 📊 **DynamoDB** | `docsaas-documents-*` | Metadados dos documentos (nome, dono, localização) |
+| 🔐 **KMS** | Customer Managed Key | Criptografia em repouso — S3 + DynamoDB |
+| 🛡️ **IAM** | 3 Roles Lambda | Controle de acesso com menor privilégio por função |
+| 📋 **CloudWatch** | Log Group (30 dias) | Logs JSON estruturados de todas as funções Lambda |
+| 📣 **SNS** | Tópico de eventos | Notificações — UPLOADED · ARCHIVED · ERROR |
 
 ---
 
-## 📁 Repository Structure
+## 📁 Estrutura do Repositório
 
 ```
 .
-├── 📄 main.yaml                    # Root template — orchestrates all nested stacks
+├── 📄 main.yaml                    # Template raiz — orquestra todas as nested stacks
 │
 ├── 📂 templates/
-│   ├── iam.yaml                    # Lambda IAM roles and policies          [stack 1]
-│   ├── monitoring.yaml             # CloudWatch Log Group + SNS Topic        [stack 2]
-│   ├── storage.yaml                # KMS CMK + S3 Standard + S3 Glacier      [stack 3]
-│   ├── database.yaml               # DynamoDB table and GSI                  [stack 4]
-│   ├── compute.yaml                # Lambda functions (Node.js 24.x)         [stack 5]
-│   └── api.yaml                    # API Gateway REST API and routes         [stack 6]
+│   ├── iam.yaml                    # Roles e políticas IAM das Lambdas          [stack 1]
+│   ├── monitoring.yaml             # CloudWatch Log Group + SNS Topic            [stack 2]
+│   ├── storage.yaml                # KMS CMK + S3 Standard + S3 Glacier          [stack 3]
+│   ├── database.yaml               # Tabela DynamoDB e GSI                       [stack 4]
+│   ├── compute.yaml                # Funções Lambda (Node.js 24.x)               [stack 5]
+│   └── api.yaml                    # API Gateway REST e rotas                    [stack 6]
 │
 ├── 📂 lambda/
 │   ├── access-verifier/
-│   │   ├── index.js                # JWT validation + pre-signed URL logic
+│   │   ├── index.js                # Validação JWT + lógica de Pre-signed URL
 │   │   ├── package.json
 │   │   └── README.md
 │   ├── metadata-handler/
-│   │   ├── index.js                # DynamoDB CRUD + SNS event publishing
+│   │   ├── index.js                # CRUD DynamoDB + publicação de eventos SNS
 │   │   ├── package.json
 │   │   └── README.md
 │   ├── archive-trigger/
-│   │   ├── index.js                # storageClass update on Glacier transition
+│   │   ├── index.js                # Atualização de storageClass na transição Glacier
 │   │   ├── package.json
 │   │   └── README.md
-│   └── test-local.js               # Local test script — no AWS required
+│   └── test-local.js               # Script de testes locais — sem AWS necessário
 │
 ├── 📂 docs/
 │   ├── architecture.md             # Architecture Decision Records (ADR)
-│   ├── api-contract.md             # Full API reference
-│   ├── data-model.md               # DynamoDB schema + S3 structure
-│   ├── security.md                 # Security model + IAM + audit logging
-│   └── simulation-guide.md         # Deployment guide + local testing
+│   ├── api-contract.md             # Referência completa da API
+│   ├── data-model.md               # Schema DynamoDB + estrutura S3
+│   ├── security.md                 # Modelo de segurança + IAM + auditoria
+│   └── simulation-guide.md         # Guia de deploy e testes locais
 │
-├── .env.example                    # Environment variable reference (MVP team)
+├── .env.example                    # Referência de variáveis de ambiente (equipe MVP)
 └── README.md
 ```
 
 ---
 
-## 🔗 Stack Dependency Chain
+## 🔗 Cadeia de Dependências entre Stacks
 
-The `main.yaml` root template provisions nested stacks in strict dependency order:
+O template raiz `main.yaml` provisiona as nested stacks na seguinte ordem de dependência:
 
 ```
 main.yaml
  │
- ├─▶ [1] iam.yaml          no upstream dependencies
- ├─▶ [2] monitoring.yaml   no upstream dependencies
- ├─▶ [3] storage.yaml      outputs → KMSKeyArn · S3BucketNames
- ├─▶ [4] database.yaml     requires → KMSKeyArn
- ├─▶ [5] compute.yaml      requires → IAM Roles · S3 · DynamoDB · SNS · CloudWatch
- └─▶ [6] api.yaml          requires → Lambda ARNs
+ ├─▶ [1] iam.yaml          sem dependências externas
+ ├─▶ [2] monitoring.yaml   sem dependências externas
+ ├─▶ [3] storage.yaml      exporta → KMSKeyArn · nomes dos buckets S3
+ ├─▶ [4] database.yaml     requer  → KMSKeyArn
+ ├─▶ [5] compute.yaml      requer  → IAM Roles · S3 · DynamoDB · SNS · CloudWatch
+ └─▶ [6] api.yaml          requer  → ARNs das Lambdas
 ```
 
 ---
 
-## 🚀 Quick Start
+## 🚀 Como Começar
 
-### Prerequisites
+### Pré-requisitos
 
 ```bash
-# Python + cfn-lint for template validation
+# Python + cfn-lint para validação dos templates
 pip install cfn-lint
 
-# Node.js 18+ for local Lambda tests
+# Node.js 18+ para testes locais das Lambdas
 node --version
 ```
 
-### 1 — Validate all templates *(no AWS account required)*
+### 1 — Validar todos os templates *(sem conta AWS)*
 
 ```bash
 cfn-lint templates/iam.yaml \
@@ -179,20 +179,20 @@ cfn-lint templates/iam.yaml \
          main.yaml
 ```
 
-### 2 — Run local Lambda tests *(no AWS account required)*
+### 2 — Executar testes locais das Lambdas *(sem conta AWS)*
 
 ```bash
 node lambda/test-local.js
 ```
 
-### 3 — Deploy to AWS *(Free Tier eligible)*
+### 3 — Deploy na AWS *(Free Tier elegível)*
 
 ```bash
-# Create a bucket to host nested stack templates
-aws s3 mb s3://docsaas-cfn-templates-{your-name}
-aws s3 cp templates/ s3://docsaas-cfn-templates-{your-name}/templates/ --recursive
+# Criar bucket para hospedar os templates das nested stacks
+aws s3 mb s3://docsaas-cfn-templates-{seu-nome}
+aws s3 cp templates/ s3://docsaas-cfn-templates-{seu-nome}/templates/ --recursive
 
-# Deploy the full stack
+# Deploy completo da stack
 aws cloudformation create-stack \
   --stack-name docsaas-simulation \
   --template-body file://main.yaml \
@@ -200,76 +200,76 @@ aws cloudformation create-stack \
   --parameters \
     ParameterKey=Environment,ParameterValue=simulation \
     ParameterKey=ProjectName,ParameterValue=docsaas \
-    ParameterKey=TemplatesBucketName,ParameterValue=docsaas-cfn-templates-{your-name}
+    ParameterKey=TemplatesBucketName,ParameterValue=docsaas-cfn-templates-{seu-nome}
 
-# Retrieve outputs after CREATE_COMPLETE (~3–5 min)
+# Consultar os Outputs após CREATE_COMPLETE (~3–5 min)
 aws cloudformation describe-stacks \
   --stack-name docsaas-simulation \
   --query 'Stacks[0].Outputs'
 
-# Tear down to avoid ongoing KMS charges
+# Remover a stack após a apresentação (evita custos do KMS)
 aws cloudformation delete-stack --stack-name docsaas-simulation
 ```
 
 ---
 
-## 🔒 Multi-Tenant Isolation
+## 🔒 Isolamento Multi-Tenant
 
-Every document is stored with an explicit tenant-scoped S3 key prefix:
+Cada documento é armazenado com um prefixo S3 exclusivo do tenant:
 
 ```
 {tenantId}/{documentId}/{filename}
 
-  tenant_acme/doc_ABC123/contract-2024.pdf     ← Acme only
-  tenant_xyz/doc_DEF456/proposal.docx          ← XYZ only
+  tenant_acme/doc_ABC123/contrato-2024.pdf     ← somente Acme acessa
+  tenant_xyz/doc_DEF456/proposta.docx          ← somente XYZ acessa
 ```
 
-The `access-verifier` Lambda extracts `tenantId` from the JWT and scopes all pre-signed URLs to that tenant's prefix. Cross-tenant access is rejected at the application layer (`HTTP 403`) and enforced independently by IAM role conditions at the AWS layer.
+A Lambda `access-verifier` extrai o `tenantId` do JWT e restringe todas as Pre-signed URLs geradas ao prefixo daquele tenant. Tentativas de acesso cruzado são rejeitadas na camada de aplicação (`HTTP 403`) e bloqueadas independentemente pelas condições das roles IAM na camada AWS.
 
 ---
 
-## 📊 CloudFormation Parameters
+## 📊 Parâmetros CloudFormation
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `Environment` | `simulation` | Deployment stage — appended to all resource names |
-| `ProjectName` | `docsaas` | Project prefix applied to all resource names |
-| `RetentionDays` | `30` | CloudWatch log retention period (days) |
-| `ArchiveDays` | `365` | Days until S3 objects transition to Glacier |
-| `TemplatesBucketName` | `docsaas-cfn-templates` | S3 bucket hosting nested stack templates |
-
----
-
-## 💰 Cost Estimate
-
-| Service | Free Tier | Demo Cost |
-|---------|-----------|-----------|
-| Lambda | 1M requests/month | **$0.00** |
-| API Gateway | 1M calls/month | **$0.00** |
-| DynamoDB | 25 GB + 25 WCU/RCU | **$0.00** |
-| S3 Standard | 5 GB | **$0.00** |
-| CloudWatch | 5 GB logs | **$0.00** |
-| SNS | 1M publishes/month | **$0.00** |
-| **KMS CMK** | — | **~$1.00/month** |
-
-> ⚠️ The KMS Customer Managed Key is the only resource with a fixed monthly cost. Run `aws cloudformation delete-stack` after the demo to stop all charges.
+| Parâmetro | Padrão | Descrição |
+|-----------|--------|-----------|
+| `Environment` | `simulation` | Ambiente de execução — sufixo aplicado a todos os recursos |
+| `ProjectName` | `docsaas` | Prefixo aplicado a todos os nomes de recursos |
+| `RetentionDays` | `30` | Período de retenção dos logs no CloudWatch (dias) |
+| `ArchiveDays` | `365` | Dias até os objetos S3 transitarem para o Glacier |
+| `TemplatesBucketName` | `docsaas-cfn-templates` | Bucket S3 que hospeda os templates das nested stacks |
 
 ---
 
-## 📚 Documentation
+## 💰 Estimativa de Custos
 
-| Document | Description |
-|----------|-------------|
-| [`docs/architecture.md`](docs/architecture.md) | Architecture Decision Records (ADR) — rationale behind every design choice |
-| [`docs/api-contract.md`](docs/api-contract.md) | Full API reference — endpoints, request/response schemas, SNS events |
-| [`docs/data-model.md`](docs/data-model.md) | DynamoDB schema, S3 key structure, data flow diagrams |
-| [`docs/security.md`](docs/security.md) | Security model, IAM roles, encryption, audit logging |
-| [`docs/simulation-guide.md`](docs/simulation-guide.md) | Step-by-step deployment and local testing guide |
+| Serviço | Free Tier | Custo Demo |
+|---------|-----------|------------|
+| Lambda | 1M requisições/mês | **R$ 0,00** |
+| API Gateway | 1M chamadas/mês | **R$ 0,00** |
+| DynamoDB | 25 GB + 25 WCU/RCU | **R$ 0,00** |
+| S3 Standard | 5 GB | **R$ 0,00** |
+| CloudWatch | 5 GB de logs | **R$ 0,00** |
+| SNS | 1M publicações/mês | **R$ 0,00** |
+| **KMS CMK** | — | **~R$ 5,00/mês** |
+
+> ⚠️ A chave KMS Customer Managed Key é o único recurso com custo fixo mensal. Execute `aws cloudformation delete-stack` após a apresentação para encerrar todas as cobranças.
+
+---
+
+## 📚 Documentação
+
+| Documento | Descrição |
+|-----------|-----------|
+| [`docs/architecture.md`](docs/architecture.md) | Architecture Decision Records — justificativa de cada decisão técnica |
+| [`docs/api-contract.md`](docs/api-contract.md) | Referência completa da API — endpoints, schemas, eventos SNS |
+| [`docs/data-model.md`](docs/data-model.md) | Schema DynamoDB, estrutura S3, diagramas de fluxo de dados |
+| [`docs/security.md`](docs/security.md) | Modelo de segurança, roles IAM, criptografia, logs de auditoria |
+| [`docs/simulation-guide.md`](docs/simulation-guide.md) | Guia passo a passo de deploy e testes locais |
 
 ---
 
 <div align="center">
 
-*Built with ❤️ for academic purposes — TCC · AWS CloudFormation · Serverless*
+*Desenvolvido com ❤️ — TCC · AWS CloudFormation · Serverless*
 
 </div>
